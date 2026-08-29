@@ -56,6 +56,13 @@ pub struct JobSpec {
 
     #[serde(default)]
     pub user_agent: Option<String>,
+
+    /// The ffmpeg binary to use. The panel resolves this through its own seam
+    /// (`app/core/ffmpeg_path.py`), which falls back to a bundled static build
+    /// where the platform has no package manager to install one. Falling back
+    /// to a bare PATH lookup here would quietly diverge from that.
+    #[serde(default)]
+    pub ffmpeg_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

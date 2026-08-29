@@ -21,6 +21,18 @@ use crate::lang;
 /// last lines carry the actual complaint.
 const STDERR_KEEP: usize = 1200;
 
+/// The ffmpeg binary, chosen once at startup by the caller.
+static FFMPEG_BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record which ffmpeg to run. Ignored if called more than once.
+pub fn set_binary(path: String) {
+    let _ = FFMPEG_BIN.set(path);
+}
+
+fn binary() -> &'static str {
+    FFMPEG_BIN.get().map(String::as_str).unwrap_or("ffmpeg")
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioTrack {
     pub path: PathBuf,
@@ -34,7 +46,7 @@ pub struct SubtitleTrack {
 }
 
 fn spawn(args: &[&str], stage: &str) -> Result<Child> {
-    Command::new("ffmpeg")
+    Command::new(binary())
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

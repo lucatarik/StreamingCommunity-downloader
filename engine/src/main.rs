@@ -168,6 +168,11 @@ async fn run(spec: &JobSpec, sink: &EventSink, cancel: &CancellationToken) -> Re
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "output".to_string());
 
+    if let Some(path) = &spec.ffmpeg_path {
+        tracing::info!("ffmpeg: {path}");
+        ffmpeg::set_binary(path.clone());
+    }
+
     let content_key = match &spec.key_hex {
         Some(hex) if !hex.trim().is_empty() => Some(playlist::parse_key_hex(hex)?),
         _ => None,

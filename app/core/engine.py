@@ -218,6 +218,7 @@ def run_download(
     subtitle_languages: Optional[list] = None,
     max_segment_workers: int = 16,
     user_agent: Optional[str] = None,
+    ffmpeg_path: Optional[str] = None,
     progress_factory=None,
     cancel_event: Optional[threading.Event] = None,
 ) -> str:
@@ -250,6 +251,10 @@ def run_download(
         spec["referer"] = referer
     if user_agent:
         spec["user_agent"] = user_agent
+    if ffmpeg_path:
+        # The panel resolves ffmpeg through app.core.ffmpeg_path; the engine must
+        # use that same binary rather than whatever its own PATH turns up.
+        spec["ffmpeg_path"] = ffmpeg_path
 
     bars = {}
     primary = []  # one-element list so the closure can assign to it
