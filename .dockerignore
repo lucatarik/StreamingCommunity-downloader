@@ -25,3 +25,10 @@ requirements-dev.txt
 # local target/ directory (gigabytes, and built for the host, not the image)
 # must never be copied in.
 engine/target/
+
+# Runtime state must never be baked into the image. panel.db in particular
+# holds the Jellyfin service API key, and `COPY . .` would ship a developer's
+# copy of it to anyone who pulls the image.
+panel.db
+data.json
+schedule.json

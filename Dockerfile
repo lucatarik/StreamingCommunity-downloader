@@ -33,10 +33,17 @@ COPY --from=engine /build/target/release/sc-dl-engine /usr/local/bin/sc-dl-engin
 
 COPY . .
 
+# The container runs as the host user (see `user:` in docker-compose), not as
+# root, so downloaded files belong to whoever browses the library rather than
+# to root — which used to leave folders nobody but root could delete. That
+# means the app must be able to create its state files here as a non-root uid.
+# Only the directories it writes into are opened up, not every file in the tree.
+RUN mkdir -p /app/tmp /app/videos && chmod a+rwx /app /app/tmp /app/videos
+
 # Fail at build time rather than on the first download if the binary did not
 # make it across.
 RUN sc-dl-engine --help >/dev/null 2>&1 || test -x /usr/local/bin/sc-dl-engine
 
 EXPOSE 8000
 
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "umask 000 && exec python main.py"]
