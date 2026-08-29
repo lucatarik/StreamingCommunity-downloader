@@ -20,3 +20,8 @@ design/
 # Tests and their dependencies do not belong in the runtime image.
 tests/
 requirements-dev.txt
+
+# Rust build artefacts: the engine is compiled in its own build stage, so a
+# local target/ directory (gigabytes, and built for the host, not the image)
+# must never be copied in.
+engine/target/

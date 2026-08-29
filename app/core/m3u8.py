@@ -198,9 +198,24 @@ class M3U8_Segments:
             # Master playlist — resolve the best quality rendition
             best_url = parser.get_best_quality()
             logger.info("Master playlist detected (%d variants), fetching best rendition: %s", len(parser.video_playlist), best_url)
-            rendition_resp = requests.get(best_url, headers=self._headers(), timeout=15)
-            if not rendition_resp.ok:
-                raise RuntimeError(f"Failed to fetch rendition M3U8: HTTP {rendition_resp.status_code}")
+            rendition_url = best_url
+            tried_with_b1 = "b=1" in best_url
+            rendition_resp = None
+            for attempt in range(max_retries):
+                rendition_resp = requests.get(rendition_url, headers=self._headers(), timeout=15)
+                if rendition_resp.ok:
+                    break
+                if rendition_resp.status_code == 403 and not tried_with_b1:
+                    logger.warning("Rendition M3U8 fetch returned 403, retrying with ?b=1: %s", rendition_url)
+                    rendition_url = rendition_url + ("&b=1" if "?" in rendition_url else "?b=1")
+                    tried_with_b1 = True
+                    time.sleep(retry_delay)
+                    continue
+                if attempt < max_retries - 1:
+                    logger.warning("Rendition M3U8 fetch returned HTTP %d, retrying in %ss... (attempt %d/%d)", rendition_resp.status_code, retry_delay, attempt + 1, max_retries)
+                    time.sleep(retry_delay)
+            if rendition_resp is None or not rendition_resp.ok:
+                raise RuntimeError(f"Failed to fetch rendition M3U8: HTTP {rendition_resp.status_code if rendition_resp is not None else 'no response'}")
             rp = M3U8_Parser()
             rp.parse_data(rendition_resp.text)
             if self.key is not None and rp.keys:
@@ -211,14 +226,20 @@ class M3U8_Segments:
             raise RuntimeError(f"M3U8 has no segments and no variant playlists. Content: {response.text[:200]!r}")
 
     def get_req_ts(self, ts_url):
+        # Any non-200 (503, 500, 403, ...) used to `return None` on the very
+        # first attempt despite the `for attempt in range(3)` loop implying
+        # otherwise — only 429 actually retried. Under CDN load, bursts of
+        # transient 503s were each treated as a permanent segment failure
+        # after a single try, silently dropping segments from the final file
+        # (see join()) while still counting as "done" in the progress bar.
         for attempt in range(3):
             try:
                 response = requests.get(ts_url, headers={"user-agent": get_headers()}, timeout=10)
                 if response.status_code == 200:
                     return response.content
-                logger.warning("Segment HTTP %d (attempt %d): ...%s", response.status_code, attempt + 1, ts_url[-60:])
-                if response.status_code == 429:
-                    time.sleep(2 ** attempt)
+                logger.warning("Segment HTTP %d (attempt %d/3): ...%s", response.status_code, attempt + 1, ts_url[-60:])
+                if attempt < 2:
+                    time.sleep(2 ** attempt if response.status_code == 429 else 1)
                     continue
                 return None
             except Exception as e:
@@ -361,7 +382,13 @@ class M3U8_Segments:
 
         still_failed = getattr(self, "_failed_segments", set())
         if still_failed:
-            logger.warning("%d segments permanently missing from output: %s", len(still_failed), sorted(still_failed))
+            logger.error("%d segments permanently missing from output: %s", len(still_failed), sorted(still_failed))
+            preview = sorted(still_failed)[:10]
+            suffix = "..." if len(still_failed) > 10 else ""
+            raise RuntimeError(
+                f"{len(still_failed)} segmenti non scaricabili dopo i retry (indici: {preview}{suffix}). "
+                "File non completo: usa \"Forza ripresa\" per riscaricare solo i segmenti mancanti."
+            )
 
         logger.info("Joining %d / %d segments...", len(ts_files), len(self.segments))
         if self.emit_join_phase and hasattr(self, '_bar') and hasattr(self._bar, 'emit_status'):
@@ -563,102 +590,49 @@ def download_m3u8(
     audio_track_urls: list[dict] = None,
     subtitle_track_urls: list[dict] = None,
 ):
-    key = bytes.fromhex(key) if key is not None else None
-
-    # Jellyfin convention: subtitles live next to the video as {stem}.{lang}.vtt
-    video_dir = os.path.dirname(output_filename) or "."
-    video_stem = os.path.splitext(os.path.basename(output_filename))[0]
+    from app.core.engine import run_download
 
     audio_languages = audio_languages or ["ita"]
     subtitle_languages = subtitle_languages or []
     audio_track_urls = audio_track_urls or []
     subtitle_track_urls = subtitle_track_urls or []
 
-    # Track subtitle files created before the main download so they can be cleaned
-    # up if the download is cancelled or fails mid-way.
-    created_subtitle_files: list[str] = []
-
-    if m3u8_playlist is not None:
-        parse_class_m3u8 = M3U8_Parser()
+    # A caller that handed over a playlist body (or a master playlist URL)
+    # instead of a rendition still has to be resolved to an index URL. The
+    # engine follows a master playlist itself, so this only covers the case
+    # where the playlist arrived as text.
+    if m3u8_index is None and m3u8_playlist is not None:
+        parser = M3U8_Parser()
         content = m3u8_playlist if "#EXTM3U" in m3u8_playlist else _fetch_text(m3u8_playlist)
-        parse_class_m3u8.parse_data(content)
-
+        parser.parse_data(content)
         if DOWNLOAD_DEFAULT_LANGUAGE:
-            m3u8_audio = parse_class_m3u8.get_track_audio("Italian")
+            m3u8_audio = parser.get_track_audio("Italian")
+        m3u8_index = parser.get_best_quality()
+        if not m3u8_index or "https" not in m3u8_index:
+            raise RuntimeError("Cannot find a valid M3U8 index URL")
 
-        if m3u8_index is None:
-            m3u8_index = parse_class_m3u8.get_best_quality()
-            if not m3u8_index or "https" not in m3u8_index:
-                raise RuntimeError("Cannot find a valid M3U8 index URL")
+    if not m3u8_index:
+        raise RuntimeError("No M3U8 index URL to download")
 
-        langs = parse_class_m3u8.available_languages()
-        logger.info("Available languages — audio: %s | subtitles: %s", langs["audio"], langs["subtitles"])
+    # A legacy caller may still pass a single audio playlist rather than the
+    # per-language list; the engine only knows about the list.
+    if m3u8_audio and not audio_track_urls:
+        audio_track_urls = [{"url": m3u8_audio, "language": audio_languages[0]}]
 
-        if DOWNLOAD_SUB and subtitle_languages:
-            from app.core.format import download_subtitle_tracks
-            created = download_subtitle_tracks(parse_class_m3u8, subtitle_languages, video_dir, video_stem, temp_dir=temp_dir)
-            created_subtitle_files.extend(t["path"] for t in created)
-
-    elif m3u8_index is not None and DOWNLOAD_SUB and subtitle_languages:
-        # m3u8_index is a master playlist URL — parse it to extract subtitles
-        try:
-            from app.core.format import download_subtitle_tracks
-            master_content = _fetch_text_with_b1_fallback(m3u8_index)
-            parse_master = M3U8_Parser()
-            parse_master.parse_data(master_content)
-            langs = parse_master.available_languages()
-            logger.info("Available languages — audio: %s | subtitles: %s", langs["audio"], langs["subtitles"])
-            created = download_subtitle_tracks(parse_master, subtitle_languages, video_dir, video_stem, temp_dir=temp_dir)
-            created_subtitle_files.extend(t["path"] for t in created)
-        except Exception as e:
-            logger.warning("Could not parse subtitles from master playlist: %s", e)
-
-    if m3u8_subtitle is not None:
-        parse_sub = M3U8_Parser()
-        content_sub = m3u8_subtitle if "#EXTM3U" in m3u8_subtitle else _fetch_text(m3u8_subtitle)
-        parse_sub.parse_data(content_sub)
-        if DOWNLOAD_SUB and subtitle_languages:
-            from app.core.format import download_subtitle_tracks
-            created = download_subtitle_tracks(parse_sub, subtitle_languages, video_dir, video_stem, temp_dir=temp_dir)
-            created_subtitle_files.extend(t["path"] for t in created)
-
-    os.makedirs(os.path.dirname(output_filename) or ".", exist_ok=True)
-
-    try:
-        return M3U8_Downloader(
-            m3u8_index,
-            m3u8_audio,
-            key=key,
-            output_filename=output_filename,
-            temp_dir=temp_dir,
-            progress_factory=progress_factory,
-            referer=referer,
-            cancel_event=cancel_event,
-            audio_languages=audio_languages,
-            subtitle_languages=subtitle_languages,
-            audio_track_urls=audio_track_urls,
-            subtitle_track_urls=subtitle_track_urls,
-        ).start()
-    except (DownloadCancelledError, Exception) as exc:
-        # Remove subtitle files already written to the output dir
-        for path in created_subtitle_files:
-            try:
-                os.remove(path)
-                logger.info("Removed partial subtitle: %s", path)
-            except OSError:
-                pass
-        # Remove partial video / remuxed MKV if they exist
-        stem = os.path.splitext(output_filename)[0]
-        for candidate in (output_filename, stem + ".mkv"):
-            try:
-                os.remove(candidate)
-                logger.info("Removed partial output: %s", candidate)
-            except OSError:
-                pass
-        # Remove the output directory if it's now empty
-        try:
-            if video_dir and video_dir != "." and not os.listdir(video_dir):
-                os.rmdir(video_dir)
-        except OSError:
-            pass
-        raise
+    # Everything below this line — retries, decryption, resume, muxing, and
+    # cleaning up after a failure — now happens in `sc-dl-engine`. See
+    # app/core/engine.py for why it is a separate process.
+    return run_download(
+        m3u8_index=m3u8_index,
+        output_path=output_filename,
+        temp_dir=temp_dir or os.path.join("tmp", "segments"),
+        key=key,
+        referer=referer,
+        audio_track_urls=audio_track_urls,
+        subtitle_track_urls=subtitle_track_urls,
+        subtitle_languages=subtitle_languages if DOWNLOAD_SUB else [],
+        max_segment_workers=get_settings().get("max_segment_workers", 16),
+        user_agent=get_headers(),
+        progress_factory=progress_factory,
+        cancel_event=cancel_event,
+    )

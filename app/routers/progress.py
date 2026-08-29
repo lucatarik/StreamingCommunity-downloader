@@ -42,6 +42,15 @@ async def stream_all_progress():
                     msg = await asyncio.wait_for(q.get(), timeout=25)
                     yield f"data: {json.dumps(msg)}\n\n"
                 except asyncio.TimeoutError:
+                    # A stream that is no longer subscribed would sit here
+                    # emitting keepalives forever: the browser sees a healthy
+                    # connection, EventSource never fires `onerror`, and the
+                    # page silently stops updating until it is reloaded. Ending
+                    # the response instead makes the client reconnect and pick
+                    # up a fresh snapshot.
+                    if not job_manager.is_subscribed(q):
+                        logger.info("SSE stream no longer subscribed; closing so the client reconnects")
+                        return
                     yield ": keepalive\n\n"
         finally:
             job_manager.unsubscribe(q)

@@ -60,6 +60,17 @@ class WebProgressBar:
         eta = (remaining / seg_speed) if seg_speed > 0 and remaining > 0 else None
         return round(seg_speed, 1), (round(eta) if eta is not None else None), round(bytes_speed)
 
+    def _enqueue(self, msg: dict):
+        """Hand a message to the SSE queue, if there is a loop to hand it to.
+
+        The loop is only bound once the app has started, so a bar that emits
+        before that (or in a test) must not leave an un-awaited coroutine
+        behind — `JobManager._emit` already guards the same way.
+        """
+        if self._loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._queue.put(msg), self._loop)
+
     def _push(self):
         seg_speed, eta, bytes_speed = self._speed_and_eta()
         pct = round(self.n / self.total * 100, 1) if self.total else 0
@@ -74,7 +85,7 @@ class WebProgressBar:
         }
         if self._phase:
             msg["phase"] = self._phase
-        asyncio.run_coroutine_threadsafe(self._queue.put(msg), self._loop)
+        self._enqueue(msg)
         if self._on_event:
             self._on_event(msg)
 
@@ -88,9 +99,27 @@ class WebProgressBar:
             self._last_emit = now
             self._push()
 
+    def push_external(self, event: dict):
+        """Forward a progress event computed by the download engine verbatim.
+
+        The engine already tracks counts, speed and ETA over the same rolling
+        window this class uses, so recomputing them here would only introduce a
+        second, slightly different answer. `n` and `total` are kept in step so
+        anything still reading them off the bar sees the truth.
+        """
+        msg = dict(event)
+        msg["type"] = "progress"
+        if self._phase and not msg.get("phase"):
+            msg["phase"] = self._phase
+        self.n = msg.get("current", self.n)
+        self.total = msg.get("total", self.total)
+        self._enqueue(msg)
+        if self._on_event:
+            self._on_event(msg)
+
     def emit_status(self, phase: str):
         msg = {"type": "status", "phase": phase}
-        asyncio.run_coroutine_threadsafe(self._queue.put(msg), self._loop)
+        self._enqueue(msg)
         if self._on_event:
             self._on_event(msg)
 

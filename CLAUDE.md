@@ -23,7 +23,9 @@ pip install -r requirements-dev.txt   # tests only; kept out of the runtime imag
 pytest -q
 ```
 
-**Prerequisites:** FFmpeg on PATH (the Docker image installs it).
+**Prerequisites:** FFmpeg on PATH, and the download engine built (the Docker
+image does both). `app/core/engine.py` looks for the binary in `SC_ENGINE_BIN`,
+then on PATH, then in `engine/target/{release,debug}/`.
 
 **Single process only.** Download job state lives in memory in `JobManager`, so running uvicorn with
 `--workers > 1` or scaling the container would leave each worker blind to the others' downloads.
@@ -38,12 +40,35 @@ request before any route runs.
 
 ### Layout
 
-**`app/core/`** — source interaction and the download engine
+**`engine/`** — the download engine, in Rust (`sc-dl-engine`)
+
+Everything below the resolved M3U8 URL: retries, AES-128 decryption, segment
+storage, resume, ffmpeg muxing. It runs as a **child process**, reads one JSON
+job spec on stdin and reports newline-delimited events on stdout. See
+`engine/src/main.rs` for the reasoning, and `engine/README.md` for the protocol.
+
+It is a separate process on purpose. A blocking network call cannot be killed
+from outside its thread in Python, so a cancel could only be *requested*; a
+wedged attempt kept running and later wrote stale state over a newer one. A
+child process can be killed, so cancellation is enforceable — which is what
+allows `jobs.py` to assume one live attempt per job.
+
+```bash
+cargo test --manifest-path engine/Cargo.toml       # 35 unit + 7 end-to-end
+cargo build --release --manifest-path engine/Cargo.toml
+```
+
+The end-to-end tests run the real binary against a fake CDN that injects 503s,
+403s and stalls, and check the output with ffprobe. They need `ffmpeg` and
+`ffprobe` on PATH.
+
+**`app/core/`** — source interaction, and the bridge to the engine
 - `page.py` — domain check, search
 - `film.py` — movie resolve + download; also owns `_collect_audio_tracks` / `_collect_subtitle_tracks`, which `tv.py` and `animeunity.py` import
 - `tv.py` — seasons, episodes, per-episode languages, episode download
 - `animeunity.py` — AnimeUnity search, episodes, download
-- `m3u8.py` — `M3U8_Parser`, `M3U8_Segments`, `M3U8_Downloader`, `Decryption`, `download_m3u8()`
+- `engine.py` — spawns `sc-dl-engine`, forwards its events to the progress bars, and turns `cancel_event` into SIGTERM (escalating to SIGKILL)
+- `m3u8.py` — `M3U8_Parser` (still used for language discovery) and `download_m3u8()`, which now delegates to the engine
 - `paths.py` — destination paths (`film_path`, `episode_path`, `anime_path`). The request system's library check goes through these, so a change here changes both.
 - `headers.py` — user-agent rotation, `sanitize_filename`
 - `_shared.py` — embed parsing, M3U8 URL/key, `MissingAudioTrackError`
@@ -98,6 +123,14 @@ anything under a mounted static directory is readable by unauthenticated visitor
 - **Never substitute an audio track.** `strict_audio=True` on the request path turns a missing
   language into an error and parks the request for a human.
 - Blocking work goes through `asyncio.to_thread` (routers) or the job pool.
+- **A job has at most one live attempt.** `resume()` waits for the previous one
+  to actually finish before starting another (`_stop_then_run`), and refuses
+  rather than run two if it will not stop. All the state writes in
+  `_run_download` depend on this — they used to be guarded by a generation
+  counter and are not any more. `tests/test_resume_isolation.py` covers it.
+- **Segments are written atomically by the engine**, so a `<n>.ts` in a temp dir
+  is always complete. That is why all attempts of a job share one temp
+  directory and why resume can trust what it finds there.
 
 ### Output layout
 

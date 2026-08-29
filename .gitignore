@@ -23,3 +23,6 @@ panel.db-shm
 # Not committed: the source domain rotates, so a baked-in value ships stale.
 data.json
 schedule.json
+
+# Rust build artefacts for the download engine
+engine/target/

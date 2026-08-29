@@ -1143,6 +1143,30 @@ async function downloadAllAnime() {
 
 // ── Global SSE stream ──────────────────────────────────────────────────────────
 
+// Pull the authoritative job list and rebuild from it.
+//
+// The SSE stream is the fast path, not the source of truth. A backgrounded tab
+// consumes slowly, and a slow consumer is exactly where a live stream can drift
+// from reality — so the moment the user looks at the page again, the list is
+// reconciled against the server instead of trusted.
+async function resyncJobs() {
+  try {
+    const res = await fetch('/api/jobs');
+    if (!res.ok) return;
+    const jobs = await res.json();
+    _jobs.clear();
+    jobs.forEach(j => _jobs.set(j.job_id, j));
+    renderAllJobCards();
+    updateActiveBadge();
+  } catch (_) {
+    // Offline or mid-reconnect: the stream's own snapshot will repair it.
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') resyncJobs();
+});
+
 function connectGlobalStream() {
   const es = new EventSource('/api/progress/stream');
 
@@ -1168,8 +1192,21 @@ function connectGlobalStream() {
       case 'job_status':
         if (_jobs.has(msg.job_id)) {
           _jobs.get(msg.job_id).status = msg.status;
+          if ('stalled' in msg) _jobs.get(msg.job_id).stalled = msg.stalled;
           refreshCardAppearance(msg.job_id);
           updateActiveBadge();
+        }
+        break;
+      case 'job_stalled':
+        if (_jobs.has(msg.job_id)) {
+          _jobs.get(msg.job_id).stalled = true;
+          refreshCardAppearance(msg.job_id);
+        }
+        break;
+      case 'job_unstalled':
+        if (_jobs.has(msg.job_id)) {
+          _jobs.get(msg.job_id).stalled = false;
+          refreshCardAppearance(msg.job_id);
         }
         break;
       case 'progress':
@@ -1215,21 +1252,23 @@ function connectGlobalStream() {
 const PHASE_LABELS = {
   scheduled:'Programmato', queued:'In coda', running:'In corso', joining:'Finalizzazione',
   audio:'Audio', merging:'Unione', done:'Completato', error:'Errore', cancelled:'Annullato',
+  stalled:'In stallo',
 };
 const PHASE_BADGE = {
   scheduled:'bg-yellow-lt', queued:'bg-secondary-lt', running:'bg-blue-lt', joining:'bg-yellow-lt',
   audio:'bg-teal-lt', merging:'bg-purple-lt', done:'bg-success-lt',
-  error:'bg-danger-lt', cancelled:'bg-secondary-lt',
+  error:'bg-danger-lt', cancelled:'bg-secondary-lt', stalled:'bg-orange-lt',
 };
 const PHASE_BAR = {
   running:'bg-blue', joining:'phase-bar-joining bg-warning',
   audio:'phase-bar-audio bg-teal', merging:'phase-bar-merging bg-purple',
   done:'phase-bar-done bg-success', error:'phase-bar-error bg-danger',
+  stalled:'bg-orange',
 };
 const PHASE_BORDER_MAP = {
   scheduled:'var(--yellow)', queued:'var(--text-dim)', running:'var(--blue)', joining:'var(--yellow)',
   audio:'var(--teal)', merging:'var(--purple)', done:'var(--green)',
-  error:'var(--accent)', cancelled:'var(--text-dim)',
+  error:'var(--accent)', cancelled:'var(--text-dim)', stalled:'var(--orange)',
 };
 
 function _stepLabel(phase) {
@@ -1299,7 +1338,10 @@ function _phaseBorder(phase) {
 }
 
 function _buildJobCard(j) {
-  const phase = _jobPhases[j.job_id] || j.status;
+  // A job that reached a terminal state always wins over a leftover stalled
+  // flag from a superseded attempt — see the generation guard in jobs.py.
+  const showStalled = j.stalled && j.status === 'running';
+  const phase = showStalled ? 'stalled' : (_jobPhases[j.job_id] || j.status);
   const isActive = j.status==='running' || j.status==='queued' || j.status==='scheduled';
   const isMovie = j.type==='film';
   const isAnimeJob = j.type==='anime';
@@ -1328,6 +1370,11 @@ function _buildJobCard(j) {
     ? `<button class="btn btn-sm btn-outline-danger ms-1" onclick="cancelJob('${j.job_id}')" title="Interrompi">
          <i class="ti ti-player-stop"></i>
        </button>` : '';
+  const canResume = showStalled || j.status === 'error' || j.status === 'cancelled';
+  const resumeBtn = canResume
+    ? `<button class="btn btn-sm btn-outline-warning ms-1" onclick="resumeJob('${j.job_id}')" title="Forza ripresa del download">
+         <i class="ti ti-refresh"></i>
+       </button>` : '';
 
   const rawTs = j.scheduled_at || j.created_at;
   const dateStr = rawTs
@@ -1344,7 +1391,9 @@ function _buildJobCard(j) {
         <span class="badge ${badgeClass} flex-shrink-0" id="job-badge-${j.job_id}">${label}</span>
         <span id="job-fire-${j.job_id}">${fireBtn}</span>
         ${stopBtn ? `<span id="job-stop-${j.job_id}">${stopBtn}</span>` : `<span id="job-stop-${j.job_id}"></span>`}
+        <span id="job-resume-${j.job_id}">${resumeBtn}</span>
       </div>
+      <div id="job-stalled-note-${j.job_id}">${showStalled ? `<div class="small text-warning mt-1"><i class="ti ti-alert-triangle"></i> Nessun progresso da un po’: potrebbe essere bloccato sulla sorgente.</div>` : ''}</div>
       ${stepsHtml}
       <div class="progress my-1" style="height:5px">
         <div class="progress-bar ${barClass}${animated} job-progress-bar" id="job-bar-${j.job_id}" style="width:${barWidth}%"></div>
@@ -1400,7 +1449,8 @@ function refreshCardAppearance(jobId) {
   const card = document.getElementById(`job-card-${jobId}`);
   if (!card) return;
 
-  const phase = _jobPhases[j.job_id] || j.status;
+  const showStalled = j.stalled && j.status === 'running';
+  const phase = showStalled ? 'stalled' : (_jobPhases[j.job_id] || j.status);
   const isActive = j.status==='running' || j.status==='queued' || j.status==='scheduled';
 
   // Update card classes and border
@@ -1433,6 +1483,19 @@ function refreshCardAppearance(jobId) {
   if (stop) {
     stop.innerHTML = isActive && j.status !== 'scheduled'
       ? `<button class="btn btn-sm btn-outline-danger ms-1" onclick="cancelJob('${j.job_id}')" title="Interrompi"><i class="ti ti-player-stop"></i></button>`
+      : '';
+  }
+  const resume = document.getElementById(`job-resume-${jobId}`);
+  if (resume) {
+    const canResume = showStalled || j.status === 'error' || j.status === 'cancelled';
+    resume.innerHTML = canResume
+      ? `<button class="btn btn-sm btn-outline-warning ms-1" onclick="resumeJob('${j.job_id}')" title="Forza ripresa del download"><i class="ti ti-refresh"></i></button>`
+      : '';
+  }
+  const stalledNote = document.getElementById(`job-stalled-note-${jobId}`);
+  if (stalledNote) {
+    stalledNote.innerHTML = showStalled
+      ? `<div class="small text-warning mt-1"><i class="ti ti-alert-triangle"></i> Nessun progresso da un po’: potrebbe essere bloccato sulla sorgente.</div>`
       : '';
   }
 
@@ -1515,8 +1578,12 @@ function handlePhaseEvent(jobId, phase) {
 function handleDoneEvent(jobId, outputPath) {
   delete _jobPhases[jobId];
   const job = _jobs.get(jobId);
-  if (job) { job.status='done'; job.output_path=outputPath; }
+  if (job) { job.status='done'; job.output_path=outputPath; job.stalled=false; }
   _updateSteps(jobId, 'done');
+  const resumeEl = document.getElementById(`job-resume-${jobId}`);
+  if (resumeEl) resumeEl.innerHTML = '';
+  const stalledNoteEl = document.getElementById(`job-stalled-note-${jobId}`);
+  if (stalledNoteEl) stalledNoteEl.innerHTML = '';
 
   const card = document.getElementById(`job-card-${jobId}`);
   if (card) card.classList.add('is-done');
@@ -1540,7 +1607,7 @@ function handleDoneEvent(jobId, outputPath) {
 function handleErrorEvent(jobId, message) {
   delete _jobPhases[jobId];
   const job = _jobs.get(jobId);
-  if (job) { job.status='error'; job.error=message; }
+  if (job) { job.status = message==='Annullato' ? 'cancelled' : 'error'; job.error=message; job.stalled=false; }
 
   const card = document.getElementById(`job-card-${jobId}`);
   if (card) card.classList.add('is-error');
@@ -1552,6 +1619,10 @@ function handleErrorEvent(jobId, message) {
   if (info) info.textContent = message==='Annullato' ? 'Annullato' : escapeHtml(message||'Errore');
   const stop = document.getElementById(`job-stop-${jobId}`);
   if (stop) stop.innerHTML='';
+  const resume = document.getElementById(`job-resume-${jobId}`);
+  if (resume) resume.innerHTML = `<button class="btn btn-sm btn-outline-warning ms-1" onclick="resumeJob('${jobId}')" title="Forza ripresa del download"><i class="ti ti-refresh"></i></button>`;
+  const stalledNoteEl = document.getElementById(`job-stalled-note-${jobId}`);
+  if (stalledNoteEl) stalledNoteEl.innerHTML = '';
 
   updateActiveBadge();
 }
@@ -1568,6 +1639,14 @@ async function cancelJob(jobId) {
   try {
     const res = await fetch(`/api/download/${jobId}`, {method:'DELETE'});
     if (!res.ok) { const d=await safeJson(res); showToast(d.detail||'Errore','danger'); }
+  } catch(e) { showToast('Errore di rete','danger'); }
+}
+
+async function resumeJob(jobId) {
+  try {
+    const res = await fetch(`/api/download/${jobId}/resume`, {method:'POST'});
+    if (res.ok) { showToast('Ripresa forzata: riparte dai segmenti già scaricati', 'success'); }
+    else { const d=await safeJson(res); showToast(d.detail||'Errore','danger'); }
   } catch(e) { showToast('Errore di rete','danger'); }
 }
 
