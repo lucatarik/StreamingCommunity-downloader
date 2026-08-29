@@ -23,9 +23,16 @@ pip install -r requirements-dev.txt   # tests only; kept out of the runtime imag
 pytest -q
 ```
 
-**Prerequisites:** FFmpeg on PATH, and the download engine built (the Docker
-image does both). `app/core/engine.py` looks for the binary in `SC_ENGINE_BIN`,
-then on PATH, then in `engine/target/{release,debug}/`.
+**Prerequisites:** FFmpeg on PATH, and the download engine built (the Docker image does both).
+`app/core/engine.py` finds the engine binary via `SC_ENGINE_BIN`, then PATH, then
+`engine/target/{release,debug}/`.
+
+All ffmpeg invocations resolve their binary through `app.core.ffmpeg_path.get_ffmpeg_exe()` —
+never call `ffmpeg`/`ffmpeg-python` directly. Order: `FFMPEG_PATH` env override, then system PATH,
+then the static binary bundled by `imageio-ffmpeg`. The fallback exists because Windows has no
+`apt install ffmpeg` equivalent — users without it on PATH used to get an opaque `WinError 2` deep
+inside the Join step. The Rust engine is held to the same rule: the resolved path is passed to it
+as `ffmpeg_path` in the job spec rather than left to its own PATH lookup.
 
 **Single process only.** Download job state lives in memory in `JobManager`, so running uvicorn with
 `--workers > 1` or scaling the container would leave each worker blind to the others' downloads.
@@ -64,14 +71,20 @@ The end-to-end tests run the real binary against a fake CDN that injects 503s,
 
 **`app/core/`** — source interaction, and the bridge to the engine
 - `page.py` — domain check, search
+- `domain_recovery.py` — finds the source domain again when it rotates: scrapes a
+  third-party page, guards the candidate, verifies it, and *proposes* it
+- `metadata.py` — plot/genres/rating/artwork/trailer, all from the title page's own props,
+  behind an in-process TTL cache
+- `naming.py` — the file/folder naming templates and their validation
 - `film.py` — movie resolve + download; also owns `_collect_audio_tracks` / `_collect_subtitle_tracks`, which `tv.py` and `animeunity.py` import
 - `tv.py` — seasons, episodes, per-episode languages, episode download
 - `animeunity.py` — AnimeUnity search, episodes, download
 - `engine.py` — spawns `sc-dl-engine`, forwards its events to the progress bars, and turns `cancel_event` into SIGTERM (escalating to SIGKILL)
-- `m3u8.py` — `M3U8_Parser` (still used for language discovery) and `download_m3u8()`, which now delegates to the engine
-- `paths.py` — destination paths (`film_path`, `episode_path`, `anime_path`). The request system's library check goes through these, so a change here changes both.
+- `m3u8.py` — `M3U8_Parser` (language discovery, and resolving a playlist handed over as text) and `download_m3u8()`, which holds the per-destination lock and delegates to the engine. `M3U8_Segments`, `M3U8_Downloader` and `Decryption` are no longer on the download path.
+- `paths.py` — destination paths (`film_path`, `episode_path`, `anime_path`). The request system's library check goes through these, so a change here changes both. Names come from `naming.py`; the optional `templates=` argument is what lets the library check ask for the *legacy* layout.
 - `headers.py` — user-agent rotation, `sanitize_filename`
-- `_shared.py` — embed parsing, M3U8 URL/key, `MissingAudioTrackError`
+- `_shared.py` — embed parsing, M3U8 URL/key, `MissingAudioTrackError`, and stream
+  resolution (`resolve_stream`, `fetch_key_from_playlist`, `_FALLBACK_PROVIDERS`)
 
 **`app/auth/`** — Jellyfin SSO, permissions, users
 - `jellyfin.py` — HTTP client (MediaBrowser header, stable DeviceId, X-Forwarded-For with retry)
@@ -84,18 +97,28 @@ The end-to-end tests run the real binary against a fake CDN that injects 503s,
 - `models.py` — records, content key, allowed transitions
 - `resolver.py` — re-resolution at approval, track verification, library check
 - `service.py` — lifecycle and job wiring
-- `notify.py` — in-app notifications
+- `notify.py` — dispatch; `CHANNELS` is the list every delivery fans out to
+- `apprise_channel.py` — external channels (Discord, Telegram, ntfy, …) as Apprise URLs
 - `router.py` — endpoints
 
-**`app/`** — `jobs.py` (thread pool, semaphore, SSE broadcast), `schedule.py`, `db.py`, `config.py`,
-`progress.py`, `routers/`, `templates/`, `static/`
+**`app/watches/`** — followed series and anime
+- `models.py` — watch records, followers, the seen-episode ledger
+- `poller.py` — periodic enumeration, diff against what is seen, auto-download decision
+- `router.py` — follow, unfollow, status, manual check
+
+**`app/`** — `jobs.py` (thread pool, semaphore, SSE broadcast), `downloads_notify.py` (notifications
+for downloads that skipped the queue, one summary per season/series), `downloads_hooks.py`
+(post-download webhooks and the Jellyfin library refresh), `schedule.py`, `db.py`,
+`config.py`, `progress.py`, `routers/`, `templates/`, `static/`
 
 ### Persistence
 
-- `panel.db` (SQLite, stdlib `sqlite3`) — users, sessions, requests, notifications. Migrations are
-  the ordered `MIGRATIONS` list in `app/db.py`, applied against `PRAGMA user_version`. Never edit an
-  applied migration; append a new one.
-- `data.json` — source domain, library paths, performance settings. Runtime state, not committed:
+- `panel.db` (SQLite, stdlib `sqlite3`) — users, sessions, requests, notifications, notification
+  channels, download hooks, followed series. Migrations are the ordered `MIGRATIONS` list in `app/db.py`, applied
+  against `PRAGMA user_version`. Never edit an applied migration; append a new one.
+- `data.json` — source domain, library paths, performance settings, domain-recovery switches,
+  naming templates. Anything carrying a secret goes in `panel.db` instead. Written only through
+  `config.update_data()`, which holds the file lock: a background thread writes `domain`. Runtime state, not committed:
   a baked-in source domain ships stale, since the domain rotates. Tests get one from the
   `_configured_domain` autouse fixture in `tests/conftest.py`.
 - `schedule.json` — scheduled downloads
@@ -123,15 +146,15 @@ anything under a mounted static directory is readable by unauthenticated visitor
 - **Never substitute an audio track.** `strict_audio=True` on the request path turns a missing
   language into an error and parks the request for a human.
 - Blocking work goes through `asyncio.to_thread` (routers) or the job pool.
-- **A job has at most one live attempt.** `resume()` waits for the previous one
-  to actually finish before starting another (`_stop_then_run`), and refuses
-  rather than run two if it will not stop. All the state writes in
-  `_run_download` depend on this — they used to be guarded by a generation
-  counter and are not any more. `tests/test_resume_isolation.py` covers it.
-- **Segments are written atomically by the engine**, so a `<n>.ts` in a temp dir
-  is always complete. That is why all attempts of a job share one temp
-  directory and why resume can trust what it finds there.
-
+- **A job has at most one live attempt.** `resume()` waits for the previous one to actually finish
+  before starting another (`_stop_then_run`), and refuses rather than run two if it will not stop.
+  The state writes in `_run_download` depend on this. `tests/test_resume_isolation.py` covers it.
+- **Segments are written atomically by the engine**, so a `<n>.ts` in a temp dir is always
+  complete. That is why every attempt of a job shares one temp directory, and why a resume can
+  trust what it finds there. A failed job keeps its scratch space; only a completed one clears it.
+- **Stall detection must skip phases that are silent by design** (`NON_PROGRESS_PHASES`). ffmpeg
+  muxing a whole film reports no progress for minutes, and flagging that offered the user a
+  "Forza ripresa" that would have discarded finished work.
 ### Output layout
 
 ```

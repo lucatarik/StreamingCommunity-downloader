@@ -25,24 +25,20 @@ logger = logging.getLogger(__name__)
 
 SCHEDULER_INTERVAL = 30  # seconds
 
-# How long a "running" job can go without a progress update before it's
-# surfaced to the user as stalled (CDN throttling a segment to a trickle
-# never trips requests' per-read timeout, so the job just crawls forever
-# with no exception to catch).
+# How long a "running" job can go without a progress update before it is
+# surfaced to the user as stalled. A CDN throttled to a trickle keeps a socket
+# technically alive, so nothing else would ever raise.
 STALL_THRESHOLD = 90  # seconds
 
-# Phases that legitimately emit no progress for minutes at a time: ffmpeg is
-# working through the whole film and there is nothing to count. Applying the
-# stall heuristic to them flagged healthy jobs as stuck and offered the user a
-# "Forza ripresa" button that would have thrown away finished work. A phase
-# transition is itself proof of life, so these are simply excluded.
+# Phases that legitimately report no progress for minutes: ffmpeg is working
+# through the whole film and there is nothing to count. Applying the stall
+# heuristic to them painted healthy jobs as stuck and offered a "Forza ripresa"
+# that would have discarded finished work.
 NON_PROGRESS_PHASES = frozenset({"joining", "merging"})
 
 # How long a forced resume waits for the previous attempt to actually stop.
 # The engine is a child process that is SIGTERMed and then SIGKILLed, so this
-# only has to cover the kill escalation plus the ffmpeg teardown; if it is ever
-# exceeded, something is wrong enough that starting a second attempt anyway
-# would make it worse.
+# only has to cover the kill escalation plus the ffmpeg teardown.
 ATTEMPT_STOP_TIMEOUT = 60  # seconds
 
 
@@ -61,19 +57,35 @@ class DownloadJob:
     phases: list = field(default_factory=list)
     progress_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     cancel_event: threading.Event = field(default_factory=threading.Event)
-    # Params needed to rebuild the download call for a forced resume — the
-    # same shape submit_*() already builds for schedule_*(), see _build_call.
-    params: dict = field(default_factory=dict)
+
     last_progress_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     stalled: bool = False
-    # The phase the engine last announced. Read by the stall check, which must
-    # not fire during a phase that has no progress to report — see
-    # NON_PROGRESS_PHASES.
+    # The phase the engine last announced, read by the stall check.
     phase: Optional[str] = None
-    # The in-flight attempt, if any. A forced resume waits on this before
-    # starting a new one, which is what guarantees a job never has two live
-    # attempts — see resume().
+    # The in-flight attempt. A forced resume waits on this before starting a new
+    # one, which is what guarantees a job never has two live attempts.
     future: Optional[Future] = None
+    # The call that runs this job, kept so a forced resume can repeat it.
+    # Storing the call rather than the parameters keeps this independent of the
+    # submit_*() signatures, which upstream changes freely.
+    call: Optional[tuple] = None
+
+    # Set when this job is one episode of a season or series asked for in one go,
+    # so the notification can be a single summary instead of one per episode.
+    batch_id: Optional[str] = None
+    batch_kind: Optional[str] = None    # "season" | "series" | "anime_all"
+    batch_label: Optional[str] = None   # computed once at submit, e.g. "Serie — Stagione 2"
+
+    # Who asked for it. None in open mode, where there is no account to notify.
+    user_id: Optional[int] = None
+
+    # Kept as separate fields rather than parsed back out of `title`, which is
+    # already a composed string ("Nome Serie S02E05") and would misparse the
+    # first time a title itself contains something like S01.
+    media_label: Optional[str] = None
+    year: Optional[str] = None
+    season: Optional[int] = None
+    episode_number: Optional[str] = None
 
 
 class JobManager:
@@ -133,6 +145,13 @@ class JobManager:
             "progress": job.progress,
             "phases": job.phases,
             "stalled": job.stalled,
+            # user_id is deliberately absent: the jobs list is readable by anyone
+            # who can download, and the field has no use in the interface.
+            "batch_id": job.batch_id,
+            "batch_kind": job.batch_kind,
+            "season": job.season,
+            "episode_number": job.episode_number,
+            "year": job.year,
         }
 
     # ── Global pub/sub ─────────────────────────────────────────────────────────
@@ -141,6 +160,15 @@ class JobManager:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
         self._subscribers.append(q)
         return q
+
+    def is_subscribed(self, q: asyncio.Queue) -> bool:
+        """Whether this queue is still receiving events.
+
+        The SSE endpoint checks this so a stream that has somehow been dropped
+        ends the response instead of hanging: an EventSource only reconnects on
+        a closed connection, never on a silent one.
+        """
+        return q in self._subscribers
 
     def unsubscribe(self, q: asyncio.Queue):
         try:
@@ -187,45 +215,27 @@ class JobManager:
                          event.get("type"), job.job_id)
         self._broadcast({**event, "job_id": job.job_id})
 
-    def is_subscribed(self, q: asyncio.Queue) -> bool:
-        """Whether this queue is still receiving events.
-
-        The SSE endpoint checks this so a stream that has somehow been dropped
-        ends the response instead of hanging: an EventSource only reconnects on
-        a closed connection, never on a silent one.
-        """
-        return q in self._subscribers
-
     async def _fanout(self, event: dict):
-        """Push an event to every subscriber, dropping data before connections.
+        """Push an event to every subscriber, dropping the oldest under pressure.
 
-        A full queue used to unsubscribe the client. That looked tidy and was
-        the worst possible outcome: the SSE generator stayed blocked on a queue
-        nobody would ever fill again, and kept emitting keepalives — so the
-        browser saw a perfectly healthy connection, never fired `onerror`, and
-        never reconnected. The downloads tab simply went quiet until the user
-        reloaded the page. A backgrounded tab consuming slowly was enough to
-        trigger it.
-
-        Now a slow consumer loses the oldest event instead of the connection.
-        That is nearly always a progress update, which the next one supersedes
-        half a second later.
+        A backgrounded tab, a slow proxy, or a season starting twenty downloads
+        at once can all fill a queue. Dropping the *subscriber* there — which is
+        what used to happen — left the browser holding an open connection nobody
+        would ever write to again: the page looked live and silently stopped
+        updating until it was reloaded. Discarding the oldest event instead
+        costs a stale frame of progress and lets the next one repair the view.
         """
         for q in list(self._subscribers):
-            try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                try:
-                    q.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
+            while True:
                 try:
                     q.put_nowait(event)
+                    break
                 except asyncio.QueueFull:
-                    # Another consumer refilled it in between; the event is
-                    # lost, but the stream lives and the next snapshot on
-                    # reconnect would repair any visible drift.
-                    logger.debug("SSE queue saturated, dropping %s", event.get("type"))
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        # Drained from under us by its own reader; try again.
+                        continue
 
     # ── Progress factory ───────────────────────────────────────────────────────
 
@@ -234,16 +244,19 @@ class JobManager:
         manager = self
 
         def on_event(ev: dict):
-            if ev.get("type") == "status":
-                # A phase transition proves the engine is alive even though it
-                # has nothing to count, so it resets the stall clock too.
-                job.phase = ev.get("phase")
+            def alive(phase):
+                job.phase = phase or job.phase
                 job.last_progress_at = datetime.now(timezone.utc)
                 if job.stalled:
                     job.stalled = False
                     manager._broadcast({"type": "job_unstalled", "job_id": job.job_id})
+
+            if ev.get("type") == "status":
+                # A phase transition proves the engine is alive even when it has
+                # nothing to count, so it resets the stall clock too.
+                alive(ev.get("phase"))
             if ev.get("type") == "progress":
-                job.phase = ev.get("phase") or job.phase
+                alive(ev.get("phase"))
                 job.progress = {
                     "current": ev["current"],
                     "total": ev["total"],
@@ -252,10 +265,6 @@ class JobManager:
                     "bytes_speed": ev.get("bytes_speed", 0),
                     "eta": ev.get("eta"),
                 }
-                job.last_progress_at = datetime.now(timezone.utc)
-                if job.stalled:
-                    job.stalled = False
-                    manager._broadcast({"type": "job_unstalled", "job_id": job.job_id})
             manager._broadcast({**ev, "job_id": job.job_id})
 
         def factory(**kwargs):
@@ -298,11 +307,8 @@ class JobManager:
     def _check_stalls(self, jobs: list, now: datetime):
         """Flag running jobs that have gone quiet for too long.
 
-        A job trickling data too slowly to trip the engine's own per-chunk
-        timeout still needs surfacing to the user. Phases that report no
-        progress by design are excluded — ffmpeg muxing a two-hour film is
-        silent for minutes, and flagging that offered a "Forza ripresa" button
-        that would have discarded finished work.
+        Phases that report no progress by design are excluded — see
+        NON_PROGRESS_PHASES.
         """
         for job in jobs:
             if job.status != "running" or job.stalled:
@@ -318,21 +324,15 @@ class JobManager:
     def _fire_job(self, job: DownloadJob, type_: str, params: dict):
         fn, args, kwargs = self._build_call(type_, params, job)
         with self._lock:
-            job.params = params
             job.status = "queued"
             if self._schedule_store is not None and job.schedule_id:
                 self._schedule_store.mark_fired(job.schedule_id)
         self._broadcast({"type": "job_status", "job_id": job.job_id, "status": "queued"})
+        job.call = (fn, args, kwargs)
         self._track(job, self._executor.submit(self._run_download, job, fn, *args, **kwargs))
 
     def _build_call(self, type_: str, params: dict, job: DownloadJob):
         pf = self._make_progress_factory(job)
-        # One temp dir per job, reused across attempts. It used to be one per
-        # *attempt*, with segments hardlinked forward, because two attempts
-        # could be alive at once and would corrupt each other's intermediate
-        # files. Neither is true any more: resume() waits for the previous
-        # attempt to be gone, and the engine writes every segment atomically,
-        # so a file that is visible here is a file that is finished.
         td = str(TMP_DIR / job.job_id)
         if type_ == "film":
             from app.core.film import download_film
@@ -341,7 +341,7 @@ class JobManager:
                 year=params.get("year"), cancel_event=job.cancel_event,
                 audio_languages=params.get("audio_languages", ["ita"]),
                 subtitle_languages=params.get("subtitle_languages", ["ita", "eng"]),
-                strict_audio=params.get("strict_audio", False),
+                tmdb_id=params.get("tmdb_id"),
             )
         if type_ == "episode":
             from app.core.tv import download_episode
@@ -353,7 +353,7 @@ class JobManager:
                 cancel_event=job.cancel_event, year=params.get("year"),
                 audio_languages=params.get("audio_languages", ["ita"]),
                 subtitle_languages=params.get("subtitle_languages", ["ita", "eng"]),
-                strict_audio=params.get("strict_audio", False),
+                tmdb_id=params.get("tmdb_id"),
             )
         if type_ == "anime":
             from app.core.animeunity import download_anime_episode
@@ -365,7 +365,6 @@ class JobManager:
                 cancel_event=job.cancel_event, year=params.get("year"),
                 audio_languages=params.get("audio_languages", ["ita"]),
                 subtitle_languages=params.get("subtitle_languages", ["ita", "eng"]),
-                strict_audio=params.get("strict_audio", False),
             )
         raise ValueError(f"Unknown schedule type: {type_!r}")
 
@@ -386,44 +385,56 @@ class JobManager:
             job = self._jobs.get(job_id)
             if not job or job.status not in ("scheduled", "queued", "running"):
                 return False
+            # A scheduled job was never handed to the executor, so _run_download
+            # will never run for it and nothing else would ever tell listeners it
+            # is over. Queued and running ones go through _run_download, which
+            # notifies on every path.
+            was_scheduled = job.status == "scheduled"
             job.cancel_event.set()
             job.status = "cancelled"
+            job.stalled = False
         self._emit(job, {"type": "error", "message": "Annullato"})
+        if was_scheduled:
+            self._notify_listeners(job)
         return True
 
     def resume(self, job_id: str) -> bool:
-        """Force-resume a stalled/failed/cancelled job.
+        """Force-resume a stalled, failed or cancelled job.
 
-        Works from "running" (only if stalled — force-restarting a healthy
-        download would be destructive), "error" and "cancelled".
-
-        The old attempt is cancelled and then *waited for* before the new one
+        The previous attempt is cancelled and then *waited for* before a new one
         starts, on a worker thread so the caller's request returns immediately.
-        That wait is the whole design: because the download now runs in a child
-        process that can be killed, "cancelled" means stopped, so a job can
-        never have two attempts alive at once — and nothing downstream has to
-        cope with the possibility that it might.
+        That wait is the design: the download runs in a child process that can
+        actually be killed, so "cancelled" means stopped, and a job can never
+        have two attempts alive at once writing the same files.
         """
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
                 return False
             if job.status == "running" and not job.stalled:
-                return False  # let a healthy download run; nothing to force
+                return False  # a healthy download is not ours to restart
             if job.status not in ("running", "error", "cancelled"):
                 return False
-            if not job.params:
-                return False  # scheduled jobs not yet fired have nothing to rebuild
+            if job.call is None:
+                return False  # a scheduled job not yet fired has nothing to repeat
             previous = job.future
             job.cancel_event.set()
             job.cancel_event = threading.Event()
+            fn, args, kwargs = job.call
+            # The stored call carries the cancel_event of the attempt that just
+            # died; the new one needs the fresh event or it would start already
+            # cancelled.
+            if "cancel_event" in kwargs:
+                kwargs = {**kwargs, "cancel_event": job.cancel_event}
+                job.call = (fn, args, kwargs)
             job.status = "queued"
             job.stalled = False
             job.error = None
+            job.phase = None
             job.last_progress_at = datetime.now(timezone.utc)
 
-        self._broadcast({"type": "job_status", "job_id": job.job_id, "status": "queued", "stalled": False})
-        fn, args, kwargs = self._build_call(job.type, job.params, job)
+        self._broadcast({"type": "job_status", "job_id": job.job_id,
+                         "status": "queued", "stalled": False})
         self._track(job, self._executor.submit(
             self._stop_then_run, job, previous, fn, *args, **kwargs
         ))
@@ -440,25 +451,22 @@ class JobManager:
             try:
                 previous.result(timeout=ATTEMPT_STOP_TIMEOUT)
             except FutureTimeout:
-                # Refusing to start is the safe answer: a second attempt would
-                # be exactly the concurrent-writer situation this design exists
-                # to prevent.
+                # Refusing is the safe answer: a second attempt would be exactly
+                # the concurrent-writer situation this design exists to prevent.
                 logger.error(
-                    "Job %s: il tentativo precedente non si è fermato entro %ss, resume annullato",
+                    "Job %s: il tentativo precedente non si e' fermato entro %ss, resume annullato",
                     job.job_id, ATTEMPT_STOP_TIMEOUT,
                 )
                 job.status = "error"
-                job.error = (
-                    "Il tentativo precedente non si è fermato: riprova fra qualche istante."
-                )
+                job.error = ("Il tentativo precedente non si e' fermato: "
+                             "riprova fra qualche istante.")
                 self._emit(job, {"type": "error", "message": job.error})
                 self._notify_listeners(job)
                 return
             except Exception:
-                # The old attempt ended by raising. That is its own business —
-                # _run_download already reported it — and it is now over, which
-                # is all this needs to know.
-                logger.info("Job %s: il tentativo precedente è terminato con errore", job.job_id)
+                # It ended by raising. _run_download already reported that, and
+                # it is now over, which is all this needs to know.
+                logger.info("Job %s: il tentativo precedente e' terminato con errore", job.job_id)
 
         self._run_download(job, fn, *args, **kwargs)
 
@@ -471,6 +479,8 @@ class JobManager:
             del self._jobs[job_id]
         if self._schedule_store is not None:
             self._schedule_store.remove_by_job_id(job_id)
+        # A failed job keeps its segments so a resume can use them; dismissing it
+        # is the user saying they will not resume.
         tmp_path = TMP_DIR / job_id
         if tmp_path.exists():
             shutil.rmtree(tmp_path, ignore_errors=True)
@@ -479,61 +489,66 @@ class JobManager:
         return True
 
     def _run_download(self, job: DownloadJob, fn, *args, **kwargs):
-        """Run one attempt at a job.
+        # Listeners fire outside the semaphore: a listener does DB writes and
+        # blocking HTTP (external notification channels), and holding a download
+        # slot for that would cost real throughput. The outer try/finally makes
+        # every path notify exactly once — including the job cancelled before it
+        # ever started, which used to return early and notify nobody, leaving
+        # anything counting completions waiting forever.
+        try:
+            with self._semaphore:
+                if job.cancel_event.is_set():
+                    job.status = "cancelled"
+                    job.stalled = False
+                    self._emit(job, {"type": "error", "message": "Annullato"})
+                    return
 
-        There is never more than one of these live per job — resume() waits for
-        the previous one to end before submitting another — so this writes job
-        state unconditionally. It used to have to ask, before every write,
-        whether a newer attempt had superseded it.
-        """
-        with self._semaphore:
-            if job.cancel_event.is_set():
-                job.status = "cancelled"
-                job.stalled = False
-                self._emit(job, {"type": "error", "message": "Annullato"})
-                self._notify_listeners(job)
-                return
+                job.status = "running"
+                self._broadcast({"type": "job_status", "job_id": job.job_id, "status": "running"})
 
-            job.status = "running"
-            self._broadcast({"type": "job_status", "job_id": job.job_id, "status": "running"})
-
-            try:
-                result = fn(*args, **kwargs)
-                job.status = "done"
-                job.stalled = False
-                job.output_path = result
-                self._emit(job, {"type": "done", "output_path": result})
-            except DownloadCancelledError:
-                job.status = "cancelled"
-                job.stalled = False
-                self._emit(job, {"type": "error", "message": "Annullato"})
-            except Exception as e:
-                logger.exception(f"Job {job.job_id} failed: {e}")
-                job.status = "error"
-                job.stalled = False
-                job.error = str(e)
-                self._emit(job, {"type": "error", "message": str(e)})
-            finally:
-                # Only a completed download clears its scratch space. A
-                # failed/cancelled/stalled one keeps it, which is what lets a
-                # forced resume pick up the segments already on disk instead of
-                # starting over — see resume() and dismiss().
-                if job.status == "done":
-                    tmp_path = TMP_DIR / job.job_id
-                    if tmp_path.exists():
-                        shutil.rmtree(tmp_path, ignore_errors=True)
-                        logger.info("Cleaned up temp dir: %s", tmp_path)
-                self._notify_listeners(job)
+                try:
+                    result = fn(*args, **kwargs)
+                    job.status = "done"
+                    job.stalled = False
+                    job.output_path = result
+                    self._emit(job, {"type": "done", "output_path": result})
+                except DownloadCancelledError:
+                    job.status = "cancelled"
+                    job.stalled = False
+                    self._emit(job, {"type": "error", "message": "Annullato"})
+                except Exception as e:
+                    logger.exception(f"Job {job.job_id} failed: {e}")
+                    job.status = "error"
+                    job.stalled = False
+                    job.error = str(e)
+                    self._emit(job, {"type": "error", "message": str(e)})
+                finally:
+                    # Only a completed download clears its scratch space. A
+                    # failed or cancelled one keeps it, which is what lets a
+                    # forced resume pick up the segments already on disk — the
+                    # engine writes them atomically, so what is there is whole.
+                    if job.status == "done":
+                        tmp_path = TMP_DIR / job.job_id
+                        if tmp_path.exists():
+                            shutil.rmtree(tmp_path, ignore_errors=True)
+                            logger.info("Cleaned up temp dir: %s", tmp_path)
+        finally:
+            self._notify_listeners(job)
 
     def _submit_job(self, job: DownloadJob, fn, *args, **kwargs) -> str:
         with self._lock:
             self._jobs[job.job_id] = job
         self._broadcast({"type": "job_created", "job": self._job_to_dict(job)})
+        job.call = (fn, args, kwargs)
         self._track(job, self._executor.submit(self._run_download, job, fn, *args, **kwargs))
         return job.job_id
 
     def _make_job(self, title: str, type_: str, scheduled_at: Optional[datetime] = None,
-                  schedule_id: Optional[str] = None, phases: list = None) -> DownloadJob:
+                  schedule_id: Optional[str] = None, phases: list = None,
+                  **meta) -> DownloadJob:
+        """Build a job. ``meta`` carries the notification fields declared on
+        DownloadJob (batch_id, user_id, season, …); unknown keys raise, which is
+        the point — a typo must not silently vanish."""
         now = datetime.now(timezone.utc)
         sa = scheduled_at.replace(tzinfo=timezone.utc) if scheduled_at and scheduled_at.tzinfo is None else scheduled_at
         status = "scheduled" if sa and sa > now else "queued"
@@ -548,6 +563,7 @@ class JobManager:
             scheduled_at=scheduled_at,
             schedule_id=schedule_id,
             phases=phases or [],
+            **meta,
         )
 
     # ── Submit (immediate) ─────────────────────────────────────────────────────
@@ -556,82 +572,120 @@ class JobManager:
                     schedule_id: str = None,
                     audio_languages: list[str] = None,
                     subtitle_languages: list[str] = None,
-                    strict_audio: bool = False) -> str:
-        params = {
-            "id": id_film, "title": title, "domain": domain, "year": year,
-            "audio_languages": audio_languages or ["ita"],
-            "subtitle_languages": subtitle_languages or ["ita", "eng"],
-            "strict_audio": strict_audio,
-        }
+                    strict_audio: bool = False,
+                    user_id: int = None,
+                    tmdb_id: int = None) -> str:
+        from app.core.film import download_film
+
         job = self._make_job(title, "film", schedule_id=schedule_id,
-                             phases=self._compute_phases(params["audio_languages"]))
-        job.params = params
-        fn, args, kwargs = self._build_call("film", params, job)
-        return self._submit_job(job, fn, *args, **kwargs)
+                             phases=self._compute_phases(audio_languages or ["ita"]),
+                             user_id=user_id, media_label=title, year=year)
+        return self._submit_job(
+            job, download_film,
+            id_film, title, domain,
+            output_dir=_get_library_path("film"),
+            temp_dir=str(TMP_DIR / job.job_id),
+            progress_factory=self._make_progress_factory(job),
+            year=year,
+            cancel_event=job.cancel_event,
+            audio_languages=audio_languages or ["ita"],
+            subtitle_languages=subtitle_languages or ["ita", "eng"],
+            strict_audio=strict_audio,
+            tmdb_id=tmdb_id,
+        )
 
     def submit_episode(self, tv_id: int, eps: list[dict], ep_index: int, domain: str,
                        token: str, tv_name: str, season: int, year: str = None,
                        schedule_id: str = None,
                        audio_languages: list[str] = None,
                        subtitle_languages: list[str] = None,
-                       strict_audio: bool = False) -> str:
-        from app.core.tv import fmt_ep
+                       strict_audio: bool = False,
+                       user_id: int = None, batch_id: str = None,
+                       batch_kind: str = None, batch_label: str = None,
+                       tmdb_id: int = None) -> str:
+        from app.core.tv import download_episode, fmt_ep
 
         ep = eps[ep_index]
         title = f"{tv_name} S{season:02d}E{fmt_ep(ep['n'])}"
-        params = {
-            "tv_id": tv_id, "eps": eps, "ep_index": ep_index,
-            "domain": domain, "token": token, "tv_name": tv_name,
-            "season": season, "year": year,
-            "audio_languages": audio_languages or ["ita"],
-            "subtitle_languages": subtitle_languages or ["ita", "eng"],
-            "strict_audio": strict_audio,
-        }
         job = self._make_job(title, "episode", schedule_id=schedule_id,
-                             phases=self._compute_phases(params["audio_languages"]))
-        job.params = params
-        fn, args, kwargs = self._build_call("episode", params, job)
-        return self._submit_job(job, fn, *args, **kwargs)
+                             phases=self._compute_phases(audio_languages or ["ita"]),
+                             user_id=user_id, batch_id=batch_id, batch_kind=batch_kind,
+                             batch_label=batch_label, media_label=tv_name, year=year,
+                             season=season, episode_number=str(ep["n"]))
+        return self._submit_job(
+            job, download_episode,
+            tv_id, eps, ep_index, domain, token, tv_name, season,
+            output_dir=_get_library_path("tv"),
+            temp_dir=str(TMP_DIR / job.job_id),
+            progress_factory=self._make_progress_factory(job),
+            cancel_event=job.cancel_event,
+            year=year,
+            audio_languages=audio_languages or ["ita"],
+            subtitle_languages=subtitle_languages or ["ita", "eng"],
+            strict_audio=strict_audio,
+            tmdb_id=tmdb_id,
+        )
 
+    # AnimeUnity deliberately gains no tmdb_id: an anime here has no TMDB
+    # identifier and its embed lives on a different host, so a fallback
+    # provider would have nothing to resolve against.
     def submit_anime_episode(self, anime_id: str, episode: dict, anime_name: str,
                              anime_type: str = "tv", year: str = None,
                              schedule_id: str = None,
                              audio_languages: list[str] = None,
                              subtitle_languages: list[str] = None,
-                             strict_audio: bool = False) -> str:
+                             strict_audio: bool = False,
+                             user_id: int = None, batch_id: str = None,
+                             batch_kind: str = None, batch_label: str = None) -> str:
+        from app.core.animeunity import download_anime_episode
+
         ep_num = episode.get("number", "?")
         title = f"{anime_name} E{ep_num}"
-        params = {
-            "anime_id": anime_id, "episode": episode, "anime_name": anime_name,
-            "anime_type": anime_type, "year": year,
-            "audio_languages": audio_languages or ["ita"],
-            "subtitle_languages": subtitle_languages or ["ita", "eng"],
-            "strict_audio": strict_audio,
-        }
         job = self._make_job(title, "anime", schedule_id=schedule_id,
-                             phases=self._compute_phases(params["audio_languages"]))
-        job.params = params
-        fn, args, kwargs = self._build_call("anime", params, job)
-        return self._submit_job(job, fn, *args, **kwargs)
+                             phases=self._compute_phases(audio_languages or ["ita"]),
+                             user_id=user_id, batch_id=batch_id, batch_kind=batch_kind,
+                             batch_label=batch_label, media_label=anime_name, year=year,
+                             episode_number=str(ep_num))
+        return self._submit_job(
+            job, download_anime_episode,
+            anime_id, episode, anime_name, anime_type,
+            output_dir=_get_library_path("anime"),
+            temp_dir=str(TMP_DIR / job.job_id),
+            progress_factory=self._make_progress_factory(job),
+            cancel_event=job.cancel_event,
+            year=year,
+            audio_languages=audio_languages or ["ita"],
+            subtitle_languages=subtitle_languages or ["ita", "eng"],
+            strict_audio=strict_audio,
+        )
 
     # ── Schedule (future) ──────────────────────────────────────────────────────
 
     def schedule_film(self, id_film: int, title: str, domain: str,
                       scheduled_at: datetime, year: str = None,
                       audio_languages: list[str] = None,
-                      subtitle_languages: list[str] = None) -> str:
+                      subtitle_languages: list[str] = None,
+                      user_id: int = None,
+                      tmdb_id: int = None) -> str:
         params = {
             "id": id_film, "title": title, "domain": domain, "year": year,
             "audio_languages": audio_languages or ["ita"],
             "subtitle_languages": subtitle_languages or ["ita", "eng"],
+            # Persisted with the schedule: the cache it came from will not
+            # survive until the job fires.
+            "tmdb_id": tmdb_id,
         }
-        return self._add_schedule("film", scheduled_at, params, title)
+        return self._add_schedule("film", scheduled_at, params, title,
+                                  user_id=user_id, media_label=title, year=year)
 
     def schedule_episode(self, tv_id: int, eps: list[dict], ep_index: int, domain: str,
                          token: str, tv_name: str, season: int,
                          scheduled_at: datetime, year: str = None,
                          audio_languages: list[str] = None,
-                         subtitle_languages: list[str] = None) -> str:
+                         subtitle_languages: list[str] = None,
+                         user_id: int = None, batch_id: str = None,
+                         batch_kind: str = None, batch_label: str = None,
+                         tmdb_id: int = None) -> str:
         from app.core.tv import fmt_ep
         ep = eps[ep_index]
         title = f"{tv_name} S{season:02d}E{fmt_ep(ep['n'])}"
@@ -641,14 +695,20 @@ class JobManager:
             "season": season, "year": year,
             "audio_languages": audio_languages or ["ita"],
             "subtitle_languages": subtitle_languages or ["ita", "eng"],
+            "tmdb_id": tmdb_id,
         }
-        return self._add_schedule("episode", scheduled_at, params, title)
+        return self._add_schedule("episode", scheduled_at, params, title,
+                                  user_id=user_id, batch_id=batch_id, batch_kind=batch_kind,
+                                  batch_label=batch_label, media_label=tv_name, year=year,
+                                  season=season, episode_number=str(ep["n"]))
 
     def schedule_anime_episode(self, anime_id: str, episode: dict, anime_name: str,
                                scheduled_at: datetime, anime_type: str = "tv",
                                year: str = None,
                                audio_languages: list[str] = None,
-                               subtitle_languages: list[str] = None) -> str:
+                               subtitle_languages: list[str] = None,
+                               user_id: int = None, batch_id: str = None,
+                               batch_kind: str = None, batch_label: str = None) -> str:
         ep_num = episode.get("number", "?")
         title = f"{anime_name} E{ep_num}"
         params = {
@@ -657,14 +717,23 @@ class JobManager:
             "audio_languages": audio_languages or ["ita"],
             "subtitle_languages": subtitle_languages or ["ita", "eng"],
         }
-        return self._add_schedule("anime", scheduled_at, params, title)
+        return self._add_schedule("anime", scheduled_at, params, title,
+                                  user_id=user_id, batch_id=batch_id, batch_kind=batch_kind,
+                                  batch_label=batch_label, media_label=anime_name, year=year,
+                                  episode_number=str(ep_num))
 
-    def _add_schedule(self, type_: str, scheduled_at: datetime, params: dict, title: str) -> str:
+    def _add_schedule(self, type_: str, scheduled_at: datetime, params: dict, title: str,
+                      **meta) -> str:
         if self._schedule_store is None:
             raise RuntimeError("ScheduleStore not configured")
         schedule_id = self._schedule_store.add(type_, scheduled_at, params)
+        # Firing reuses this same job object, so notification metadata set here
+        # survives until the download actually runs. It does not survive a
+        # restart (load_scheduled_from_store rebuilds from the JSON params), and
+        # neither does the in-memory batch it would belong to.
         job = self._make_job(title, type_, scheduled_at=scheduled_at, schedule_id=schedule_id,
-                             phases=self._compute_phases(params.get("audio_languages") or ["ita"]))
+                             phases=self._compute_phases(params.get("audio_languages") or ["ita"]),
+                             **meta)
         with self._lock:
             self._jobs[job.job_id] = job
         self._schedule_store.set_job_id(schedule_id, job.job_id)

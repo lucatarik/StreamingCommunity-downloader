@@ -8,6 +8,8 @@ from app.core.headers import get_headers, sanitize_filename
 from app.core.m3u8 import download_m3u8, fetch_master_languages, M3U8_Parser
 from app.core.paths import film_path
 from app.core._shared import (
+    StreamSource,
+    resolve_stream,
     MissingAudioTrackError,
     _fetch_vixcloud_embed,
     _parse_content,
@@ -78,6 +80,18 @@ def _collect_audio_tracks(m3u8_url: str, referer: str, audio_languages: list[str
             return tracks
         parser = M3U8_Parser()
         parser.parse_data(req.text)
+
+        # No separate audio renditions at all: this source muxes its single
+        # soundtrack into the video rendition. There is nothing to choose
+        # between and nothing to substitute, so strict has nothing to protect
+        # against — the file that comes back carries the only audio there is.
+        # Raising here rejected every such title at approval, after the request
+        # had already been accepted: the create path (router.py) skips its own
+        # check for exactly this case, so the two disagreed.
+        if not parser.audio_ts:
+            logger.info("No separate audio renditions offered; using the muxed track")
+            return tracks
+
         for lang in audio_languages:
             url = _get_audio_track_url(parser, lang)
             if url:
@@ -144,18 +158,30 @@ def download_film(id_film: int, title_name: str, domain: str,
                   cancel_event=None,
                   audio_languages: list[str] = None,
                   subtitle_languages: list[str] = None,
-                  strict_audio: bool = False):
+                  strict_audio: bool = False,
+                  tmdb_id: int = None):
     audio_languages = audio_languages or ["ita"]
     subtitle_languages = subtitle_languages or []
 
-    embed_content, embed_referer = _get_iframe(id_film, domain)
-    json_win_video, json_win_param = _parse_content(embed_content, embed_referer)
-    logger.info("Video ID: %s token: %.8s... embed_url: %s", json_win_video['id'], json_win_param.get('token', ''), embed_referer[:80])
-    logger.info("Audio language: %s", json_win_video.get("lang", "it"))
+    def _primary() -> StreamSource:
+        embed_content, embed_referer = _get_iframe(id_film, domain)
+        json_win_video, json_win_param = _parse_content(embed_content, embed_referer)
+        logger.info("Video ID: %s token: %.8s... embed_url: %s", json_win_video['id'], json_win_param.get('token', ''), embed_referer[:80])
+        logger.info("Audio language: %s", json_win_video.get("lang", "it"))
+        return StreamSource(
+            m3u8_url=_get_m3u8_url(json_win_video, json_win_param),
+            key_hex=_get_m3u8_key(json_win_video, json_win_param, embed_referer),
+            referer=embed_referer,
+            provider="vixcloud",
+        )
 
-    m3u8_url = _get_m3u8_url(json_win_video, json_win_param)
-    m3u8_key = _get_m3u8_key(json_win_video, json_win_param, embed_referer)
+    stream = resolve_stream(_primary, tmdb_id=tmdb_id, media_type="movie")
+    m3u8_url, m3u8_key, embed_referer = stream.m3u8_url, stream.key_hex, stream.referer
+    if stream.provider != "vixcloud":
+        logger.info("Resolved %s through the %s fallback", title_name, stream.provider)
 
+    # Runs against whichever playlist answered, so a missing language is still a
+    # MissingAudioTrackError rather than a quiet substitution.
     audio_track_urls = _collect_audio_tracks(
         m3u8_url, embed_referer, audio_languages, strict=strict_audio
     )
