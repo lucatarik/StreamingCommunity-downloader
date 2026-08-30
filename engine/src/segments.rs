@@ -19,6 +19,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use aes::Aes128;
 use aes::cipher::block_padding::{NoPadding, Pkcs7};
@@ -47,8 +48,54 @@ const PROVENANCE_MARKER: &str = ".sc-engine-v1";
 /// plays for ten minutes and then skips.
 const ACCEPTABLE_LOSSES: usize = 0;
 
+/// When to stop rather than grind on against a source serving nothing.
+///
+/// Counted as an unbroken run: any segment that arrives resets it. Losing some
+/// segments is ordinary — sixteen workers provoke exactly the rate limiting
+/// that produces it — and the sequential second pass exists to repair those, so
+/// the breaker must only catch a source refusing outright.
+///
+/// Without one, a dead source is not an error but a wait: five attempts per
+/// segment with backoff, in parallel, and then a *sequential* second pass over
+/// every failure. On a feature-length playlist that is hours before the user is
+/// told anything, where a breaker says it in minutes.
+///
+/// Set well above any refusal run seen in practice. Too high costs a few extra
+/// minutes on a source that is already dead; too low aborts a download that
+/// would have completed, which is far worse.
+const FAILURE_ABORT_STREAK: usize = 200;
+
 pub struct SegmentStore {
     dir: PathBuf,
+}
+
+/// Consecutive-failure breaker, shared by every worker on one track.
+#[derive(Default)]
+struct Breaker {
+    streak: std::sync::atomic::AtomicUsize,
+    tripped: std::sync::atomic::AtomicBool,
+}
+
+impl Breaker {
+    fn record_success(&self) {
+        self.streak.store(0, Ordering::Relaxed);
+    }
+
+    /// Returns true once the run of failures says the source is refusing.
+    fn record_failure(&self) -> bool {
+        let run = self.streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if run >= FAILURE_ABORT_STREAK && !self.tripped.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                "{run} segmenti rifiutati di fila: la fonte non sta servendo nulla, mi fermo"
+            );
+            return true;
+        }
+        run >= FAILURE_ABORT_STREAK
+    }
+
+    fn is_tripped(&self) -> bool {
+        self.tripped.load(Ordering::Relaxed)
+    }
 }
 
 impl SegmentStore {
@@ -215,6 +262,7 @@ pub async fn download_all(
 
     // ── Pass 1: parallel ───────────────────────────────────────────────────
     let semaphore = Arc::new(Semaphore::new(workers.max(1)));
+    let breaker = Arc::new(Breaker::default());
     let mut tasks: JoinSet<(usize, Result<u64>)> = JoinSet::new();
 
     for index in pending {
@@ -225,9 +273,16 @@ pub async fn download_all(
         let dir = store.dir.clone();
         let semaphore = Arc::clone(&semaphore);
         let cancel = cancel.clone();
+        let breaker = Arc::clone(&breaker);
 
         tasks.spawn(async move {
             if cancel.is_cancelled() {
+                return (index, Err(EngineError::Cancelled));
+            }
+            // Once the source has been written off, a queued segment does not
+            // even ask. Attempts already in flight still run to their end: the
+            // work is done and its result, good or bad, still counts.
+            if breaker.is_tripped() {
                 return (index, Err(EngineError::Cancelled));
             }
             // Concurrency is bounded here rather than at spawn time so the
@@ -256,14 +311,25 @@ pub async fn download_all(
         let Some(joined) = joined else { break };
 
         match joined {
-            Ok((_index, Ok(bytes))) => progress.advance(1, bytes),
-            Ok((_index, Err(EngineError::Cancelled))) => {
+            Ok((_index, Ok(bytes))) => {
+                breaker.record_success();
+                progress.advance(1, bytes);
+            }
+            Ok((index, Err(EngineError::Cancelled))) => {
+                // A worker that stood down because the breaker had already
+                // tripped is not a cancellation: the job still has to end as a
+                // source failure, with the segment recorded as missing.
+                if breaker.is_tripped() {
+                    failed.insert(index);
+                    continue;
+                }
                 tasks.shutdown().await;
                 return Err(EngineError::Cancelled);
             }
             Ok((index, Err(e))) => {
                 tracing::warn!("segmento {index} fallito: {e}");
                 failed.insert(index);
+                breaker.record_failure();
             }
             Err(join_error) if join_error.is_cancelled() => {}
             Err(join_error) => {
@@ -280,7 +346,7 @@ pub async fn download_all(
     }
 
     // ── Pass 2: sequential, for whatever the CDN refused under load ────────
-    if !failed.is_empty() {
+    if !failed.is_empty() && !breaker.is_tripped() {
         tracing::warn!(
             "{} segmenti da ritentare in sequenza",
             failed.len()
@@ -304,12 +370,26 @@ pub async fn download_all(
                 Ok(bytes) => {
                     tracing::info!("segmento {index} recuperato al secondo passaggio");
                     failed.remove(&index);
+                    breaker.record_success();
                     progress.advance(1, bytes);
                 }
                 Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
-                Err(e) => tracing::error!("segmento {index} definitivamente perso: {e}"),
+                Err(e) => {
+                    tracing::error!("segmento {index} definitivamente perso: {e}");
+                    if breaker.record_failure() {
+                        break;  // the source is gone; stop asking
+                    }
+                }
             }
         }
+    }
+
+    if breaker.is_tripped() {
+        return Err(EngineError::SourceRefusing {
+            streak: FAILURE_ABORT_STREAK,
+            done: total - failed.len(),
+            total,
+        });
     }
 
     if failed.len() > ACCEPTABLE_LOSSES {
@@ -453,6 +533,60 @@ mod tests {
         assert_eq!(bytes, 14);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn a_run_short_of_the_threshold_does_not_trip() {
+        let breaker = Breaker::default();
+        for _ in 0..FAILURE_ABORT_STREAK - 1 {
+            assert!(!breaker.record_failure());
+        }
+        assert!(!breaker.is_tripped());
+    }
+
+    #[test]
+    fn the_run_trips_exactly_at_the_threshold() {
+        let breaker = Breaker::default();
+        for _ in 0..FAILURE_ABORT_STREAK - 1 {
+            breaker.record_failure();
+        }
+        assert!(breaker.record_failure(), "the Nth failure is the one that trips");
+        assert!(breaker.is_tripped());
+    }
+
+    /// The property that keeps this from aborting healthy downloads: sixteen
+    /// workers provoke exactly the rate limiting that loses segments, and the
+    /// sequential pass repairs those. Only an *unbroken* run means the source
+    /// has stopped serving.
+    #[test]
+    fn any_success_resets_the_run() {
+        let breaker = Breaker::default();
+        for _ in 0..10 {
+            for _ in 0..FAILURE_ABORT_STREAK - 1 {
+                breaker.record_failure();
+            }
+            breaker.record_success();
+        }
+        assert!(
+            !breaker.is_tripped(),
+            "ten near-misses broken by a success must not add up to a trip"
+        );
+    }
+
+    #[test]
+    fn tripping_stays_tripped_however_many_workers_notice() {
+        let breaker = Breaker::default();
+        for _ in 0..FAILURE_ABORT_STREAK {
+            breaker.record_failure();
+        }
+        let further: Vec<bool> = (0..5).map(|_| breaker.record_failure()).collect();
+        assert!(further.iter().all(|&x| x));
+        assert!(breaker.is_tripped());
+    }
+
+    #[test]
+    fn a_fresh_breaker_is_not_tripped() {
+        assert!(!Breaker::default().is_tripped());
     }
 
     #[test]

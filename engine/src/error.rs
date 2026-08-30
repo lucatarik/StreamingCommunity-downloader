@@ -48,6 +48,20 @@ pub enum EngineError {
     #[error("ffmpeg non trovato nel PATH")]
     FfmpegMissing,
 
+    /// The source is refusing outright rather than shedding load. Distinct from
+    /// MissingSegments because the advice differs: retrying now is pointless,
+    /// where a handful of lost segments is exactly what a resume repairs.
+    #[error(
+        "La fonte ha rifiutato {streak} segmenti di fila e non sta servendo nulla. \
+         Download interrotto dopo {done} segmenti su {total}: riprova più tardi, \
+         oppure usa \"Forza ripresa\" per continuare da qui."
+    )]
+    SourceRefusing {
+        streak: usize,
+        done: usize,
+        total: usize,
+    },
+
     #[error("errore su {path}: {source}")]
     Io {
         path: PathBuf,
