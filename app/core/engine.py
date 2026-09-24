@@ -257,7 +257,13 @@ def run_download(
         spec["ffmpeg_path"] = ffmpeg_path
 
     bars = {}
-    primary = []  # one-element list so the closure can assign to it
+    primary = []   # one-element list so the closure can assign to it
+    # Last (segments, bytes) seen per phase. The engine reports running totals;
+    # WebProgressBar wants increments, and keeps its own totals so it can
+    # extrapolate the phase's eventual size and chain `prior_bytes` across
+    # phases. Feeding it deltas means the panel's own readout stays the single
+    # source of those numbers.
+    seen = {}
 
     def bar_for(phase, total):
         """Reuse one progress bar per phase, matching the old per-phase bars."""
@@ -273,9 +279,17 @@ def run_download(
     def on_event(event):
         kind = event.get("type")
         if kind == "progress":
-            bar = bar_for(event.get("phase"), event.get("total", 0))
-            if bar is not None and hasattr(bar, "push_external"):
-                bar.push_external(event)
+            phase = event.get("phase")
+            bar = bar_for(phase, event.get("total", 0))
+            if bar is None:
+                return
+            previous_n, previous_bytes = seen.get(phase, (0, 0))
+            n = event.get("current", 0)
+            total_bytes = event.get("bytes", 0)
+            seen[phase] = (n, total_bytes)
+            # Never negative: a resume reports segments already on disk as one
+            # jump, and a malformed frame must not rewind the bar.
+            bar.update(max(0, n - previous_n), bytes=max(0, total_bytes - previous_bytes))
         elif kind == "status":
             # "joining" and "merging" belong to the download as a whole; the
             # frontend keys its phase list off whichever bar is live.

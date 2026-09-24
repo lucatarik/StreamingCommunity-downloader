@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.png" alt="StreamingCommunity Downloader" width="520"/>
+  <img src="docs/banner.png" alt="StreamingCommunity Downloader" width="720"/>
 </p>
 
 <p align="center">
@@ -12,17 +12,94 @@
 
 ## Screenshots
 
+<p align="center">
+  <img src="docs/home.png" alt="Start page" width="90%"/>
+</p>
+<p align="center">
+  <sub><b>The start page</b> — the source's own shelves, browsable before you have searched for
+  anything.</sub>
+</p>
+
+### Finding something
+
 <table>
   <tr>
-    <td><img src="docs/search.png" alt="Search"/></td>
-    <td><img src="docs/serie-detail.png" alt="Series detail"/></td>
+    <td width="50%" valign="top">
+      <img src="docs/search.png" alt="Search results"/><br/>
+      <sub><b>Search</b> — films, series and anime across both sources, with the state of each
+      title readable on the card.</sub>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/film-detail.png" alt="Film page"/><br/>
+      <sub><b>Film page</b> — plot, genres, rating, artwork and trailer, taken from the title page
+      itself. No API key involved.</sub>
+    </td>
   </tr>
   <tr>
-    <td><img src="docs/episode-list.png" alt="Episode list"/></td>
-    <td><img src="docs/file-manager.png" alt="File manager"/></td>
+    <td width="50%" valign="top">
+      <img src="docs/serie-detail.png" alt="Series page"/><br/>
+      <sub><b>Series page</b> — seasons and episodes, with the audio and subtitle tracks each one
+      actually offers.</sub>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/downloads.png" alt="Downloads"/><br/>
+      <sub><b>Downloads</b> — live progress per phase (video → audio → merge), as one list rather
+      than a wall of cards.</sub>
+    </td>
+  </tr>
+</table>
+
+### Asking, approving, following
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/request.png" alt="My requests"/><br/>
+      <sub><b>My requests</b> — what you asked for and how far it got. A request can be withdrawn
+      until it is resolved.</sub>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/request-approval.png" alt="Request queue"/><br/>
+      <sub><b>Request queue</b> — approving re-resolves the title and verifies the tracks first: a
+      request that cannot find the audio asked for is parked, never substituted.</sub>
+    </td>
   </tr>
   <tr>
-    <td colspan="2"><img src="docs/settings.png" alt="Settings" width="50%"/></td>
+    <td colspan="2" align="center" valign="top">
+      <img src="docs/series-follow.png" alt="Followed series" width="60%"/><br/>
+      <sub><b>Followed series</b> — new episodes are looked for on their own. A followed series
+      never downloads by itself: it opens a request, which goes through the queue or is approved
+      on the spot, according to the permissions of whoever follows it.</sub>
+    </td>
+  </tr>
+</table>
+
+### Running it
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/settings.png" alt="Settings"/><br/>
+      <sub><b>Settings</b> — libraries, performance, naming templates, notification channels and
+      download hooks.</sub>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/jellyfin-users.png" alt="Users"/><br/>
+      <sub><b>Users</b> — imported from Jellyfin, with independent permissions. There is no ADMIN
+      super-permission: an administrator who never sees the request queue is a valid setup.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/file-manager.png" alt="File manager"/><br/>
+      <sub><b>File manager</b> — drag-and-drop, video streaming in place, and the free space left
+      on the media volume.</sub>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/login.png" alt="Login"/><br/>
+      <sub><b>Login</b> — Jellyfin credentials, so no second account and no local password store.
+      Authentication is opt-in; the panel also runs open.</sub>
+    </td>
   </tr>
 </table>
 
@@ -115,13 +192,14 @@ pytest -q
 ### Upgrading from v1
 
 v1 is the panel before the Jellyfin login existed. **Pulling the new image changes nothing by
-default**: `AUTH_ENABLED` is off unless you set it, so the panel stays as open as it was. You will
-see the redesigned interface, and you have to set the source domain once (see above).
+default**: a panel that was running without a login keeps running without one. You will see the
+redesigned interface, and you have to set the source domain once (see above).
 
 To turn the login on, copy the `/app/config` volume and the `DB_FILE` / `DATA_FILE` /
-`SCHEDULE_FILE` variables from `docker-compose.template.yml`, then set `AUTH_ENABLED=1`. That volume
-is not optional: users, sessions and requests live in `panel.db`, which without it sits inside the
-container and is lost on every pull.
+`SCHEDULE_FILE` variables from `docker-compose.template.yml`, then connect Jellyfin from
+**Impostazioni → Accesso e utenti**. That volume is not optional: users, sessions and requests live
+in `panel.db`, which without it sits inside the container and is lost on every pull — including the
+answer to the setup question, which would then be asked again on every restart.
 
 To stay on v1, pin the tag instead of following `latest`:
 
@@ -137,8 +215,9 @@ and the `/app/config` volume are the same, so `panel.db` and your users carry ov
 
 ## Users, roles and requests
 
-With `AUTH_ENABLED=1`, the first sign-in configures the panel and creates its administrator; only a
-Jellyfin administrator can do it. After that, Jellyfin accounts **do not** get access automatically —
+On first run the panel asks once, on its setup screen, whether to use Jellyfin. Choosing **Collega a
+Jellyfin** configures the panel and creates its administrator from that sign-in; only a Jellyfin
+administrator can do it. After that, Jellyfin accounts **do not** get access automatically —
 an administrator imports them from **Utenti** and assigns permissions. Opening the panel to every
 Jellyfin account is a switch on that page, off by default.
 
@@ -172,10 +251,14 @@ its name.
 
 ### Running without Jellyfin
 
-Leave `AUTH_ENABLED` unset (or `0`) and the panel runs with no login at all: every visitor gets
-direct download, settings and the file manager. With `AUTH_ENABLED=1` you get the same result by
-pressing **Continua senza Jellyfin** on the setup screen, and can connect Jellyfin later from
-**Impostazioni → Accesso e utenti** without a restart.
+Press **Continua senza Jellyfin** on the setup screen and the panel runs with no login at all: every
+visitor gets direct download, settings and the file manager. You can connect Jellyfin later from
+**Impostazioni → Accesso e utenti**, without a restart.
+
+There is no environment variable for this. It used to be `AUTH_ENABLED`, which is gone: set to `0`
+it did not just default to open mode, it hid the setup screen altogether, so the choice the panel
+offers could not be made. An existing deployment that was running without it keeps open mode across
+the upgrade — the panel writes that answer into `panel.db` the first time it starts.
 
 Going back — from a connected Jellyfin to no login — is deliberately not offered in the UI: the
 imported users and their permissions would be left in an ambiguous state.
@@ -246,7 +329,6 @@ failed and why.
 | `TMP_DIR` | `tmp` | HLS segments while a job runs, cleaned up afterwards |
 | `FFMPEG_PATH` | — | full path to `ffmpeg`, when it is not on `PATH` |
 | `FFPROBE_PATH` | — | full path to `ffprobe`; see the note below |
-| `AUTH_ENABLED` | `0` | `1` enables Jellyfin login, requests and users |
 | `DOMAIN_SOURCE_URL` | a public page | where replacement domains are read from |
 | `DOMAIN_NAME_PATTERN` | `streaming(community\|unity)…` | which names may be adopted automatically |
 | `COOKIE_SECURE` | `0` | set to `1` when serving over HTTPS |
@@ -404,3 +486,29 @@ the video as `{name}.{lang}.vtt`, the layout Jellyfin expects.
 ## License
 
 MIT
+
+---
+
+## Disclaimer
+
+This project is published for **informational and educational purposes only**. It exists to
+demonstrate how HLS streams are parsed, how AES-CBC segment decryption works, how a download queue
+and a permission model are built, and how the result is organised into a Jellyfin library.
+
+It **hosts, stores and distributes nothing**. It contains no content, no catalogue and no index. It
+is a client: it talks to third-party websites that it neither operates nor controls, and it has no
+affiliation, sponsorship or endorsement from any of them — StreamingCommunity, AnimeUnity and
+Jellyfin included. Every trademark belongs to its owner. Whether those sites are lawful to use, and
+whether they remain reachable at all, is entirely outside this project's control.
+
+Using it is your decision and your responsibility. You are the one who has to comply with the
+copyright law of your country and with the terms of service of any site you point it at, and you
+should only download content you hold the rights to or are otherwise entitled to access. Neither
+the authors nor the contributors take any responsibility for how the software is used, nor for any
+damage or legal consequence that follows from using it.
+
+The software is provided "as is", without warranty of any kind, as set out in the
+[LICENSE](LICENSE).
+
+If you represent a rights holder and believe something here is a problem, please open an issue and
+it will be addressed.

@@ -12,9 +12,11 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::spec::Event;
 
-/// Matches `WebProgressBar._EMIT_INTERVAL` — the panel's SSE stream and its
-/// frontend were tuned around this cadence.
-const EMIT_INTERVAL: Duration = Duration::from_millis(500);
+/// Deliberately *half* `WebProgressBar._EMIT_INTERVAL`. The panel's bar
+/// re-throttles these frames at 500ms, and two independent 500ms throttles
+/// beating against each other drop roughly every other frame. Emitting twice
+/// as often leaves the panel's bar as the only thing deciding the cadence.
+const EMIT_INTERVAL: Duration = Duration::from_millis(250);
 /// Matches `WebProgressBar._SPEED_WINDOW`.
 const SPEED_WINDOW: Duration = Duration::from_secs(5);
 
@@ -138,6 +140,7 @@ impl Progress {
             pct,
             speed: (seg_speed * 10.0).round() / 10.0,
             bytes_speed: byte_speed.round() as u64,
+            bytes: state.bytes,
             eta,
         });
     }

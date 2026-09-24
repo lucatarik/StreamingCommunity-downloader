@@ -103,6 +103,10 @@ pub enum Event {
         speed: f64,
         /// Bytes per second.
         bytes_speed: u64,
+        /// Bytes fetched so far in this phase. The panel's progress bar wants
+        /// deltas, not rates, so it can keep its own running totals and the
+        /// size estimate it extrapolates from them.
+        bytes: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         eta: Option<u64>,
     },
