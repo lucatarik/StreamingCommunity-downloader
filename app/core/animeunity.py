@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import re
 import time
 
@@ -11,7 +10,12 @@ from app.core.headers import sanitize_filename
 
 logger = logging.getLogger(__name__)
 
-ANIMEUNITY_HOST = os.getenv("ANIMEUNITY_HOST", "www.animeunity.so")
+def host() -> str:
+    """AnimeUnity's current host. Read per call: Settings can change it live."""
+    from app.config import configured_animeunity_host
+    return configured_animeunity_host()
+
+
 BATCH_SIZE = 120
 
 # What /archivio/get-animes answers per call. Not ours to choose — it is the
@@ -61,7 +65,7 @@ def fetch_home_html() -> str:
     Shared with the start page, which reads its shelves out of this same HTML.
     """
     global _csrf
-    r = _get_scraper().get(f"https://{ANIMEUNITY_HOST}/", timeout=15)
+    r = _get_scraper().get(f"https://{host()}/", timeout=15)
     r.raise_for_status()
     try:
         meta = BeautifulSoup(r.text, "lxml").find("meta", {"name": "csrf-token"})
@@ -70,6 +74,12 @@ def fetch_home_html() -> str:
     except Exception as e:
         logger.debug("Error extracting CSRF token: %s", e)
     return r.text
+
+
+def forget_csrf() -> None:
+    """Drop the cached token: it belongs to the host that issued it."""
+    global _csrf
+    _csrf = None
 
 
 def _csrf_token() -> str | None:
@@ -86,7 +96,7 @@ def _ajax_headers(token: str | None) -> dict:
     headers = {
         "Accept": "application/json, text/plain, */*",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"https://{ANIMEUNITY_HOST}/archivio",
+        "Referer": f"https://{host()}/archivio",
         "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
@@ -195,7 +205,7 @@ def _post_archive(body: dict):
     """
     global _csrf
     scraper = _get_scraper()
-    url = f"https://{ANIMEUNITY_HOST}/archivio/get-animes"
+    url = f"https://{host()}/archivio/get-animes"
 
     r = scraper.post(url, json=body, headers=_ajax_headers(_csrf_token()), timeout=20)
     if r.status_code in (403, 419):
@@ -250,9 +260,9 @@ def get_episodes(anime_id: str) -> list[dict]:
     Returns list of {id, number} dicts.
     """
     scraper = _get_scraper()
-    host = ANIMEUNITY_HOST
+    au_host = host()
 
-    r = scraper.get(f"https://{host}/info_api/{anime_id}", timeout=15)
+    r = scraper.get(f"https://{au_host}/info_api/{anime_id}", timeout=15)
     r.raise_for_status()
     episodes_count = r.json().get("episodes_count", 0)
 
@@ -263,7 +273,7 @@ def get_episodes(anime_id: str) -> list[dict]:
     for start in range(0, episodes_count + 1, BATCH_SIZE):
         end = min(start + BATCH_SIZE - 1, episodes_count)
         batch_r = scraper.get(
-            f"https://{host}/info_api/{anime_id}/0",
+            f"https://{au_host}/info_api/{anime_id}/0",
             params={"start_range": start, "end_range": end},
             timeout=15,
         )
@@ -275,30 +285,32 @@ def get_episodes(anime_id: str) -> list[dict]:
 
 def _get_embed_content(episode_id) -> tuple[str, str]:
     """
-    Fetch the vixcloud.co embed page for an episode.
+    Fetch the vixcloud embed page for an episode.
     Returns (script_text, embed_url) — same shape as film._get_iframe().
     """
     scraper = _get_scraper()
-    host = ANIMEUNITY_HOST
+    au_host = host()
 
-    # AnimeUnity returns the vixcloud.co embed URL as plain text
-    r = scraper.get(f"https://{host}/embed-url/{episode_id}", timeout=15)
+    # AnimeUnity returns the vixcloud embed URL as plain text
+    r = scraper.get(f"https://{au_host}/embed-url/{episode_id}", timeout=15)
     r.raise_for_status()
     embed_url = r.text.strip()
 
     if not embed_url.startswith("http"):
         raise RuntimeError(f"Unexpected embed-url response: {embed_url[:100]!r}")
 
+    from app.core._shared import apply_video_host
+    embed_url = apply_video_host(embed_url)
     logger.info("Episode %s embed URL: %s", episode_id, embed_url[:80])
 
-    # Fetch the vixcloud.co embed page. vixcloud.co now serves this /embed/ HTML
+    # Fetch the vixcloud embed page. vixcloud now serves this /embed/ HTML
     # page behind Cloudflare, so plain requests.get returns a 403 challenge page.
     # Use the cloudscraper session to clear the challenge. (The downstream
     # /playlist, /storage/enc.key and CDN segment URLs are NOT Cloudflare-gated
     # and still work with plain requests.)
     req_embed = scraper.get(
         embed_url,
-        headers={"Referer": f"https://{host}/"},
+        headers={"Referer": f"https://{au_host}/"},
         timeout=15,
     )
     req_embed.raise_for_status()
@@ -309,7 +321,7 @@ def _get_embed_content(episode_id) -> tuple[str, str]:
         raise RuntimeError("Empty embed page body")
     script = body.find("script")
     if not script:
-        raise RuntimeError("No script tag found in vixcloud.co embed page")
+        raise RuntimeError("No script tag found in vixcloud embed page")
 
     logger.info("Embed script (first 400 chars): %s", script.text[:400])
     return script.text, embed_url
@@ -341,8 +353,10 @@ def download_anime_episode(
 ) -> str:
     """
     Full download pipeline for a single anime episode.
-    - Series (anime_type="tv"): videos/AnimeName/Season 01/AnimeName S01E01.mp4
-    - Movies (anime_type="movie"): videos/AnimeName (YYYY)/AnimeName.mp4
+    - Movies (anime_type="movie" or "film", any case): videos/AnimeName (YYYY)/AnimeName.mkv
+    - Anything else (TV, ONA, OVA, Special, …): videos/AnimeName/Season 01/AnimeName S01E01.mkv
+
+    The extension is whatever app.core.container is configured to write.
     """
     audio_languages = audio_languages or ["ita"]
     subtitle_languages = subtitle_languages or []
@@ -371,12 +385,26 @@ def download_anime_episode(
     )
     subtitle_track_urls = _collect_subtitle_tracks(m3u8_url, embed_url, subtitle_languages)
 
-    mp4_path = anime_path(output_dir, anime_name, episode_number, anime_type, year)
+    # A folder a person associated with this anime wins — which is how the
+    # parts of one series, separate titles at the source, land in one folder
+    # at the season and episode their offsets say (app/library.py).
+    from app.core.paths import is_anime_series
+    from app.library import destination
+
+    dest_path = destination("anime", anime_id, root=output_dir, episode=episode_number,
+                            year=year, single_file=not is_anime_series(anime_type))
+    if not dest_path and is_anime_series(anime_type):
+        # The series' folder already on disk, whatever year it carries (#24).
+        from app.requests.resolver import ANIME, series_episode_path
+
+        dest_path = series_episode_path(ANIME, anime_id, output_dir, anime_name, 1,
+                                        episode_number, year, anime_type=anime_type)
+    dest_path = dest_path or anime_path(output_dir, anime_name, episode_number, anime_type, year)
 
     final_path = download_m3u8(
         m3u8_index=m3u8_url,
         key=m3u8_key,
-        output_filename=mp4_path,
+        output_filename=dest_path,
         temp_dir=temp_dir,
         progress_factory=progress_factory,
         referer=embed_url,
@@ -387,5 +415,6 @@ def download_anime_episode(
         subtitle_track_urls=subtitle_track_urls,
     )
 
-    # download_m3u8 returns the real output path (e.g. .mkv after remux)
-    return final_path or mp4_path
+    # download_m3u8 returns the real output path: the destination is built in
+    # whatever container is configured, and the remux keeps it.
+    return final_path or dest_path

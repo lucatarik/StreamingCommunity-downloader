@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 
 from app.core.headers import get_headers, sanitize_filename
 from app.core.m3u8 import download_m3u8, fetch_master_languages, M3U8_Parser
+from app.core.page import get_localized, site_url
 from app.core._shared import (
     MissingAudioTrackError,
     StreamSource,
@@ -15,6 +16,8 @@ from app.core._shared import (
     _parse_content,
     _get_m3u8_key,
     _get_m3u8_url,
+    embed_referer,
+    apply_video_host,
 )
 from app.core.paths import episode_path, fmt_ep  # noqa: F401  (fmt_ep re-exported)
 
@@ -43,8 +46,8 @@ def get_title_props(id_film: int, title_name: str, site_version: str, domain: st
     page, and splitting this in two would mean two copies of the Inertia header
     dance.
     """
-    req = requests.get(
-        f"https://{domain}/it/titles/{id_film}-{title_name}",
+    req = get_localized(
+        domain, f"/titles/{id_film}-{title_name}",
         headers={
             "X-Inertia": "true",
             "X-Inertia-Version": site_version,
@@ -69,11 +72,11 @@ def get_info_tv(id_film: int, title_name: str, site_version: str, domain: str) -
 
 
 def get_info_season(tv_id: int, tv_name: str, domain: str, version: str, token: str, n_stagione: int) -> list[dict]:
-    req = requests.get(
-        f"https://{domain}/it/titles/{tv_id}-{tv_name}/season-{n_stagione}",
+    req = get_localized(
+        domain, f"/titles/{tv_id}-{tv_name}/season-{n_stagione}",
         headers={
             "authority": f"{domain}",
-            "referer": f"https://{domain}/it/titles/{tv_id}-{tv_name}",
+            "referer": site_url(domain, f"/titles/{tv_id}-{tv_name}"),
             "user-agent": get_headers(),
             "x-inertia": "true",
             "x-inertia-version": version,
@@ -128,7 +131,7 @@ def _get_iframe(tv_id, ep_id, domain, token):
             params=params,
             cookies=cookies,
             headers={
-                "referer": f"https://{domain}/it/watch/{tv_id}?e={ep_id}",
+                "referer": site_url(domain, f"/watch/{tv_id}?e={ep_id}"),
                 "user-agent": ua,
             },
             timeout=15,
@@ -138,8 +141,8 @@ def _get_iframe(tv_id, ep_id, domain, token):
     else:
         raise RuntimeError(f"Cannot fetch episode iframe: HTTP {req.status_code}")
 
-    url_embed = BeautifulSoup(req.text, "lxml").find("iframe").get("src")
-    # vixcloud.co /embed/ is behind Cloudflare — fetch via cloudscraper.
+    url_embed = apply_video_host(BeautifulSoup(req.text, "lxml").find("iframe").get("src"))
+    # The vixcloud /embed/ is behind Cloudflare — fetch via cloudscraper.
     script_text = _fetch_vixcloud_embed(url_embed, referer=f"https://{domain}/")
     return script_text, url_embed
 
@@ -160,10 +163,7 @@ def get_tv_languages(tv_id: int, slug: str, domain: str, version: str) -> dict:
     embed_content, url_embed = _get_iframe(tv_id, eps[0]["id"], domain, token)
     json_win_video, json_win_param = _parse_content(embed_content, url_embed)
     m3u8_url = _get_m3u8_url(json_win_video, json_win_param)
-    referer = (
-        f"https://vixcloud.co/embed/{json_win_video['id']}"
-        f"?token={json_win_param['token']}&expires={json_win_param['expires']}"
-    )
+    referer = embed_referer(json_win_video, json_win_param)
     langs = fetch_master_languages(m3u8_url, referer)
     explicit_lang = parse_qs(urlparse(url_embed).query).get("lang", [None])[0]
     langs["lang"] = explicit_lang
@@ -180,10 +180,7 @@ def get_episode_languages(tv_id: int, ep_id: int, domain: str, token: str) -> di
     embed_content, url_embed = _get_iframe(tv_id, ep_id, domain, token)
     json_win_video, json_win_param = _parse_content(embed_content, url_embed)
     m3u8_url = _get_m3u8_url(json_win_video, json_win_param)
-    referer = (
-        f"https://vixcloud.co/embed/{json_win_video['id']}"
-        f"?token={json_win_param['token']}&expires={json_win_param['expires']}"
-    )
+    referer = embed_referer(json_win_video, json_win_param)
     return fetch_master_languages(m3u8_url, referer)
 
 
@@ -217,7 +214,7 @@ def download_episode(
         logger.info("Video ID: %s token: %.8s... audio lang: %s", json_win_video['id'], json_win_param.get('token', ''), json_win_video.get('lang', 'it'))
 
         embed_referer = (
-            f"https://vixcloud.co/embed/{json_win_video['id']}"
+            f"https://{json_win_video['host']}/embed/{json_win_video['id']}"
             f"?token={json_win_param['token']}&title={quote(tv_name)}"
             f"&referer=1&expires={json_win_param['expires']}"
             f"&description=S{season}%3AE{ep['n']}+{quote(ep['name'])}&nextEpisode=1"
@@ -242,12 +239,21 @@ def download_episode(
     )
     subtitle_track_urls = _collect_subtitle_tracks(m3u8_url, embed_referer, subtitle_languages)
 
-    mp4_path = episode_path(output_dir, tv_name, season, ep["n"], year)
+    # A folder a person associated with this series wins, placed at the
+    # season and episode its offsets say (app/library.py); otherwise the
+    # series' folder already on disk, whatever year it carries (#24).
+    from app.library import destination
+    from app.requests.resolver import EPISODE, series_episode_path
+
+    dest_path = (destination("episode", tv_id, root=output_dir, season=season,
+                             episode=ep["n"], year=year)
+                 or series_episode_path(EPISODE, tv_id, output_dir, tv_name, season,
+                                        ep["n"], year))
 
     final_path = download_m3u8(
         m3u8_index=m3u8_url,
         key=m3u8_key,
-        output_filename=mp4_path,
+        output_filename=dest_path,
         temp_dir=temp_dir,
         progress_factory=progress_factory,
         referer=embed_referer,
@@ -258,5 +264,6 @@ def download_episode(
         subtitle_track_urls=subtitle_track_urls,
     )
 
-    # download_m3u8 returns the real output path (e.g. .mkv after remux)
-    return final_path or mp4_path
+    # download_m3u8 returns the real output path: the destination is built in
+    # whatever container is configured, and the remux keeps it.
+    return final_path or dest_path

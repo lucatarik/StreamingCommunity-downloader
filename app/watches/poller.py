@@ -8,9 +8,11 @@ whether that request is approved on the spot or waits for a human.
 
 import asyncio
 import logging
+from dataclasses import replace
 
 from app.auth.permissions import Permission
 from app.config import get_settings
+from app.core import paths
 from app.requests import models as request_models, resolver, service
 from app.watches import models
 
@@ -70,6 +72,41 @@ def current_episodes(watch: models.Watch) -> list[tuple[str, dict]]:
         for episode in episodes or []:
             found.append((episode_key(models.TV, season, episode["n"]), {**episode, "season": season}))
     return found
+
+
+def available_tracks(watch: models.Watch) -> dict:
+    """Audio and subtitle languages on the latest published episode.
+
+    The latest rather than the first, which is what the title page samples:
+    a watch is about the episodes still to come, and tracks change over a
+    series' life — a dub arriving from season 3 on, subtitles dropped later.
+    """
+    if watch.media_type == models.ANIME:
+        from app.core import animeunity
+
+        episodes = animeunity.get_episodes(watch.external_id)
+        if not episodes:
+            raise RuntimeError("nessun episodio letto dalla fonte")
+        langs = animeunity.get_episode_languages(episodes[-1]["id"])
+    else:
+        from app.core.page import get_domain_version
+        from app.core.tv import get_episode_languages, get_info_season, get_info_tv, get_token
+
+        tv_id = int(watch.external_id)
+        domain = resolver.current_domain()
+        version = get_domain_version(domain) or ""
+        token = get_token(tv_id, domain)
+        seasons = get_info_tv(tv_id, watch.slug or "", version, domain) or 0
+        episodes = get_info_season(tv_id, watch.slug or "", domain, version, token, seasons) \
+            if seasons else []
+        if not episodes:
+            raise RuntimeError("nessun episodio letto dalla fonte")
+        langs = get_episode_languages(tv_id, episodes[-1]["id"], domain, token)
+    # The playlist lists a language once per rendition; the choice is per language.
+    return {
+        "audio": list(dict.fromkeys(langs.get("audio") or [])),
+        "subtitles": list(dict.fromkeys(langs.get("subtitles") or [])),
+    }
 
 
 # ── Decision ───────────────────────────────────────────────────────────────────
@@ -237,11 +274,53 @@ def process_episode(watch: models.Watch, key: str, episode: dict) -> str:
     return outcome
 
 
+def refresh_year(watch: models.Watch) -> models.Watch:
+    """The watch with its series' premiere year, corrected if it was stored wrong.
+
+    The year is taken from the client when a series is followed, and before
+    issue #21 the client sent the latest season's year: a follow from then keeps
+    naming every new episode's folder after a year that is simply wrong, and a
+    different wrong year from any download started by hand (#24). The title
+    page's props carry the premiere, so the stored value is brought in line.
+
+    Only for StreamingCommunity series — AnimeUnity's year never had the
+    problem — and only a year that was actually read replaces the stored one:
+    a failed lookup must not erase it. Best effort: the metadata is cached, and
+    a miss leaves the watch exactly as it was.
+    """
+    if watch.media_type != models.TV:
+        return watch
+    try:
+        from app.core import metadata
+
+        year = metadata.title_metadata("tv", watch.external_id, watch.slug or "", "").get("year")
+    except Exception:
+        logger.info("Cannot read the year of watch %s; keeping %s", watch.id, watch.year)
+        return watch
+    if not year or str(year) == str(watch.year or ""):
+        return watch
+    logger.info("Watch %s (%s): year %s -> %s", watch.id, watch.title, watch.year, year)
+    models.set_year(watch.id, str(year))
+    return replace(watch, year=str(year))
+
+
 def poll_watch(watch: models.Watch) -> dict:
-    """Check one series. Returns a small summary, mostly for tests and logs."""
+    """Check one series. Returns a small summary, mostly for tests and logs.
+
+    An anime film is skipped. Following one is refused now, but a watch made
+    before that still exists, and every request it made would land on the same
+    single file.
+    """
+    if watch.media_type == models.ANIME and not paths.is_anime_series(watch.anime_type):
+        logger.debug("Watch %s (%s) is an anime film, skipped", watch.id, watch.title)
+        return {"checked": 0, "new": 0, "outcomes": {}}
     episodes = current_episodes(watch)
     seen = models.seen_keys(watch.id)
     fresh = [(key, ep) for key, ep in episodes if key not in seen]
+    # Only when something new is about to land: the year decides where it
+    # goes, and a quiet cycle has no use for the lookup.
+    if fresh:
+        watch = refresh_year(watch)
 
     outcomes: dict[str, int] = {}
     for key, episode in fresh:
@@ -263,6 +342,15 @@ def run_poll_cycle() -> dict:
     """One pass over every active watch. Never raises: one bad series must not
     stop the others, and the loop above must keep running."""
     summary = {"watches": 0, "new": 0}
+    # First, so a folder renamed outside the panel is followed before this
+    # cycle asks whether a new episode is already there. Riding on this loop
+    # because it is the panel's one periodic pass over the library.
+    try:
+        from app import library
+
+        library.reconcile()
+    except Exception:
+        logger.exception("Library reconciliation failed")
     for watch in models.list_all():
         summary["watches"] += 1
         try:

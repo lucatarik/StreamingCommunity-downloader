@@ -9,11 +9,12 @@ the client sent or values frozen at request time.
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable
 
 from app.config import DATA_FILE, VIDEOS_DIR
-from app.core import animeunity, naming, paths, probe
+from app.core import animeunity, container, naming, paths, probe
 from app.requests import models
 
 logger = logging.getLogger(__name__)
@@ -82,8 +83,32 @@ def library_dir(media_type: str) -> str:
 
 
 def destination_path(request: models.Request, templates: dict | None = None) -> str:
-    """Where this request's file would land, using the downloader's own layout."""
+    """Where this request's file would land, using the downloader's own layout.
+
+    A folder a person has associated with the title wins, exactly as it does
+    in the download itself (``library.destination``); otherwise an episode
+    joins the series' folder already on disk (``series_home``). Not for an explicit
+    ``templates``: that asks where the file would be under a given layout,
+    which is a question about names, not about this title.
+    """
     output_dir = library_dir(request.media_type)
+    if templates is None:
+        from app import library
+
+        placed = library.destination(
+            request.media_type, request.external_id, root=output_dir,
+            season=request.season, episode=request.episode_number, year=request.year,
+            single_file=_single_file(request),
+        )
+        if placed:
+            return placed
+        if request.media_type == EPISODE or (request.media_type == ANIME
+                                             and not _single_file(request)):
+            return series_episode_path(
+                request.media_type, request.external_id, output_dir, request.title,
+                request.season or 1, request.episode_number or "1", request.year,
+                anime_type=request.anime_type,
+            )
     if request.media_type == FILM:
         return paths.film_path(output_dir, request.title, request.year, templates)
     if request.media_type == EPISODE:
@@ -100,24 +125,29 @@ def destination_path(request: models.Request, templates: dict | None = None) -> 
 def candidate_paths(*bases: str) -> list[str]:
     """Every path a file could be sitting at, given where it would land.
 
-    Two axes. The extension, because the downloader remuxes to .mkv as soon as
-    there is more than one audio track. And the naming template, because
-    changing it must not make files already in the library invisible: they would
-    be re-downloaded to the new name, leaving a duplicate of something that was
+    Two axes. The container, because it is a setting now: a file downloaded
+    before it was changed carries the other extension, and it must not become
+    invisible for that. And the naming template, because changing that must not
+    make files already in the library invisible either: they would be
+    re-downloaded to the new name, leaving a duplicate of something that was
     already there — so callers pass the current template's path *and* the
     legacy one, current first, since a library that has been renamed should win
     over a legacy file left behind.
 
-    With the default configuration both templates render the same path and the
-    deduplication collapses this back to the two stats it has always been.
+    One stat per known container, the configured extension first, so the file
+    the panel would write today is the one looked for first. With the default
+    configuration both templates render the same path and the deduplication
+    collapses this back to the two stats it has always been.
 
     Takes rendered paths rather than a Request so the episode list can ask the
     same question without one. The rule lives here once; see existing_file()
     and the library check in app/routers/tv.py.
     """
+    extensions = container.candidate_extensions()
     candidates = []
     for base in dict.fromkeys(bases):
-        candidates.extend([base, os.path.splitext(base)[0] + ".mkv"])
+        stem = os.path.splitext(base)[0]
+        candidates.extend(stem + ext for ext in extensions)
     return list(dict.fromkeys(candidates))
 
 
@@ -126,19 +156,256 @@ def first_existing(*bases: str) -> str | None:
     return next((p for p in candidate_paths(*bases) if os.path.exists(p)), None)
 
 
-def _candidate_paths(request: models.Request) -> list[str]:
-    return candidate_paths(
+_YEAR_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
+
+
+def _norm_year(year) -> str | None:
+    text = str(year).strip() if year not in (None, "", 0) else ""
+    return text or None
+
+
+def series_years(output_dir: str, title: str, year,
+                 folder_for: Callable = paths.series_folder,
+                 exclude: set[str] = frozenset()) -> list[str | None]:
+    """Every year this series' folder already exists under, canonical first.
+
+    A series' folder is named after its year, and that year has not always been
+    the right one: before issue #21 it came from ``last_air_date``, so each
+    download named the folder after whichever season was latest at the time,
+    and before there was a year at all it had none. One series ends up spread
+    over ``I Simpson/``, ``I Simpson (2025)/`` and ``I Simpson (2026)/`` (#24),
+    and a check that looks only at the canonical folder calls every episode in
+    the other two missing — and downloads them again.
+
+    Candidates are found by rendering the folder template with each year the
+    library root mentions and keeping the renders that exist, so a custom
+    template is honoured without parsing folder names back. A year *before*
+    the canonical one is refused: the wrong years were always a later season's,
+    never an earlier one, while an earlier year is what a remake's original
+    looks like — "Shōgun (1980)" must not satisfy "Shōgun (2024)". The folder
+    with no year is always accepted: that is simply an older version's layout.
+
+    Returns just the canonical year when the root cannot be listed, so the
+    check degrades to what it was rather than failing. ``folder_for`` is
+    ``paths.anime_folder`` for an anime, whose folder has its own template.
+    ``exclude`` holds the folders a person has said are not this title's
+    (``library.rejected_folders``); a year whose folder is one of them is not
+    offered, or a correction would last only until the next check.
+    """
+    canonical = _norm_year(year)
+    years: list[str | None] = [canonical]
+    try:
+        with os.scandir(output_dir) as entries:
+            names = {e.name for e in entries if e.is_dir()}
+    except OSError:
+        return years
+
+    floor = int(canonical) if canonical and canonical.isdigit() else None
+    found = sorted({y for name in names for y in _YEAR_RE.findall(name)}, reverse=True)
+    layouts = (naming.templates(), naming.LEGACY_TEMPLATES)
+    for candidate in [None, *found]:
+        if candidate == canonical:
+            continue
+        if candidate is not None and floor is not None and int(candidate) < floor:
+            continue
+        rendered = {folder_for(title, candidate, t) for t in layouts}
+        if rendered & names and not rendered <= exclude:
+            years.append(candidate)
+    return years
+
+
+def episode_candidates(output_dir: str, title: str, season, episode_number,
+                       years: list[str | None], container: str | None = None) -> list[str]:
+    """Where an episode could be sitting: each year's folder, each layout.
+
+    Canonical year first, then current template before legacy, so the file the
+    panel would write today wins over one left behind in an older folder.
+    """
+    bases = []
+    for year in years:
+        for templates in (None, naming.LEGACY_TEMPLATES):
+            bases.append(paths.episode_path(output_dir, title, season, episode_number,
+                                            year, templates, container=container))
+    return bases
+
+
+def series_home(output_dir: str, title: str, year, season, *, anime: bool = False,
+                exclude: set[str] = frozenset()) -> tuple[str | None, dict | None]:
+    """The ``(year, templates)`` whose folder a new episode of this series joins.
+
+    The series' folder already on disk, not the canonical one, when the two
+    differ (#24): a series kept in ``Ted Lasso (2026)/`` got its next episode in
+    a brand new ``Ted Lasso (2020)/`` — the right year, but Jellyfin then shows
+    two series, one of them holding a single episode. Among the folders
+    ``series_years`` finds, the one holding the most episodes of this season
+    wins, then the one holding the most episodes at all, then the canonical,
+    which comes first. Counting is what keeps one stray file from capturing the
+    series: it was the fear of exactly that which made the canonical folder
+    the only destination, and a folder with one episode loses to the one with
+    forty. A season split across folders follows its larger half.
+
+    Returns the canonical ``(year, None)`` when there is nothing to choose
+    between. Never raises: a library that cannot be read is no reason for a
+    download that has already fetched its bytes to fail.
+    """
+    from app import library
+
+    folder_for = paths.anime_folder if anime else paths.series_folder
+    canonical = (year or None, None)
+    try:
+        years = series_years(output_dir, title, year, folder_for, exclude=exclude)
+        if len(years) < 2:
+            return canonical
+        try:
+            key_season = int(season)
+        except (TypeError, ValueError):
+            key_season = None
+        # A folder holding no episode never wins: an empty one is not where
+        # the series lives, only where something once was or will be.
+        best, best_score = canonical, (0, 0)
+        for candidate in years:
+            for templates in (None, naming.LEGACY_TEMPLATES):
+                name = folder_for(title, candidate, templates)
+                folder = os.path.join(output_dir, name)
+                if name in exclude or not os.path.isdir(folder):
+                    continue
+                keys = library.episode_files([folder]).keys()
+                score = (sum(1 for s, _ in keys if s == key_season), len(keys))
+                # Strictly greater: on a tie the earlier candidate stays, and
+                # the canonical year is listed first.
+                if score > best_score:
+                    best, best_score = (candidate, templates), score
+                break
+        return best
+    except Exception:
+        logger.exception("Cannot choose the folder of %s; using the canonical one", title)
+        return canonical
+
+
+def series_episode_path(media_type: str, external_id, output_dir: str, title: str,
+                        season, episode_number, year, anime_type: str | None = None,
+                        container: str | None = None) -> str:
+    """Where a new episode lands when no person has decided: see ``series_home``.
+
+    Built with the same ``paths`` builders the check probes, under the year and
+    layout chosen, so the download and the check cannot disagree about it.
+    """
+    from app import library
+
+    anime = media_type == ANIME
+    try:
+        exclude = library.rejected_folders(library.SOURCE_BY_KIND[media_type],
+                                           media_type, external_id)
+    except Exception:
+        logger.exception("Cannot read the rejected folders of %s", external_id)
+        exclude = set()
+    home_year, templates = series_home(output_dir, title, year, 1 if anime else season,
+                                       anime=anime, exclude=exclude)
+    if anime:
+        return paths.anime_path(output_dir, title, episode_number, anime_type or "tv",
+                                home_year, templates, container=container)
+    return paths.episode_path(output_dir, title, season, episode_number, home_year,
+                              templates, container=container)
+
+
+def _rejected(request: models.Request) -> set[str]:
+    from app import library
+
+    try:
+        return library.rejected_folders(request.source, request.media_type, request.external_id)
+    except Exception:
+        logger.exception("Cannot read the rejected folders of %s", request.external_id)
+        return set()
+
+
+def _destinations(request: models.Request) -> list[str]:
+    if request.media_type == EPISODE:
+        output_dir = library_dir(EPISODE)
+        return episode_candidates(
+            output_dir, request.title, request.season or 1, request.episode_number or "1",
+            series_years(output_dir, request.title, request.year, exclude=_rejected(request)),
+        )
+    if request.media_type == ANIME and paths.is_anime_series(request.anime_type):
+        output_dir = library_dir(ANIME)
+        years = series_years(output_dir, request.title, request.year, paths.anime_folder,
+                             exclude=_rejected(request))
+        return [
+            paths.anime_path(output_dir, request.title, request.episode_number or "1",
+                             request.anime_type or "tv", year, templates)
+            for year in years for templates in (None, naming.LEGACY_TEMPLATES)
+        ]
+    return [
         destination_path(request),
         destination_path(request, templates=naming.LEGACY_TEMPLATES),
+    ]
+
+
+def _single_file(request: models.Request) -> bool:
+    """A film or an anime film: one file, straight in its folder."""
+    return request.media_type == FILM or (
+        request.media_type == ANIME and not paths.is_anime_series(request.anime_type)
     )
+
+
+def _registered_file(request: models.Request) -> str | None:
+    """The file the registry's folders hold for this request. Never raises:
+    the name-based check has already answered, and this only adds to it."""
+    from app import library
+
+    single_file = _single_file(request)
+    try:
+        return library.find(
+            request.source, request.media_type, request.external_id,
+            library_dir(request.media_type),
+            season=request.season, episode=request.episode_number, year=request.year,
+            single_file=single_file,
+        )
+    except Exception:
+        logger.exception("Library registry lookup failed for %s %s",
+                         request.media_type, request.external_id)
+        return None
 
 
 def existing_file(request: models.Request) -> str | None:
-    """The file already occupying this request's destination, if any."""
-    return first_existing(
-        destination_path(request),
-        destination_path(request, templates=naming.LEGACY_TEMPLATES),
+    """The file already occupying this request's destination, if any.
+
+    Where the name says it should be first, then the folders the registry has
+    filed under this title (``app.library``), which find it even when the
+    title or the year it was saved under has changed since. For an episode the
+    first step includes the same series' folders under other years — see
+    ``series_years`` — which is what covers a library older than the registry.
+
+    A new download goes to ``destination_path``: the folder a person associated
+    with the title, else — for an episode — the series' folder already on disk
+    that holds most of it, so the library does not grow another folder.
+    """
+    return first_existing(*_destinations(request)) or _registered_file(request)
+
+
+def episode_on_disk(media_type: str, source: str, external_id, title: str, year,
+                    season, episode_number, anime_type: str | None = None) -> bool:
+    """Whether one episode already has a file, by the same check a request gets.
+
+    For a batch asked to skip what is already there (#30). Presence only, not
+    languages: a person picking "solo mancanti" means files that are absent,
+    and a file with one track too few is still a file they chose to keep.
+    """
+    draft = models.Request(
+        id=0, content_key="", source=source, media_type=media_type,
+        external_id=str(external_id), slug=None, title=title, year=year, poster=None,
+        season=season, episode_number=str(episode_number), anime_type=anime_type,
+        audio_languages=[], subtitle_languages=[], available_snapshot=None,
+        status=models.PENDING, problem=None, denial_reason=None, requested_by=0,
+        decided_by=None, decided_at=None, job_id=None, output_path=None,
+        created_at="", updated_at="",
     )
+    try:
+        return existing_file(draft) is not None
+    except Exception:
+        # Unknown means download it: a skipped episode nobody fetches is the
+        # worse mistake.
+        logger.exception("Library check failed for %s %s", title, episode_number)
+        return False
 
 
 def library_gap(request: models.Request) -> dict | None:

@@ -25,13 +25,14 @@ one live attempt per job and none of the above is needed.
 ```json
 {
   "m3u8_index": "https://cdn.example/v/master.m3u8",
-  "output_path": "/library/Film (2020)/Film (2020).mp4",
+  "output_path": "/library/Film (2020)/Film (2020).mkv",
   "temp_dir": "tmp/<job-id>",
   "key_hex": "00112233445566778899aabbccddeeff",
   "referer": "https://vixcloud.co/embed/1234?token=...",
   "audio_tracks":    [{ "url": "https://…/audio-ita.m3u8", "language": "ita" }],
   "subtitle_tracks": [{ "uri": "https://…/sub-ita.m3u8",   "language": "ita" }],
   "subtitle_languages": ["ita", "eng"],
+  "subtitle_mode": "embed",
   "max_segment_workers": 16,
   "user_agent": "Mozilla/5.0 …"
 }
@@ -44,6 +45,13 @@ declares `EXT-X-KEY:METHOD=AES-128`; a key given for an unencrypted stream is
 ignored rather than used. `subtitle_languages` are looked up among the master
 playlist's own subtitle renditions and merged with `subtitle_tracks`.
 
+The extension of `output_path` is the container (`.mkv` or `.mp4`) and is
+never changed: a remux writes a dot-prefixed sibling and renames it over the
+output. Video and audio are always copied; the only conversion is WebVTT to
+`mov_text` when subtitles are embedded into MP4. `subtitle_mode` is `embed`
+(default, muxed in) or `external` (left beside the video as
+`<stem>.<lang>.vtt`).
+
 ## Output
 
 Newline-delimited JSON on stdout, one object per line:
@@ -52,7 +60,7 @@ Newline-delimited JSON on stdout, one object per line:
 |-------------|-------------------------------------------------------------------|
 | `progress`  | `phase`, `current`, `total`, `pct`, `speed`, `bytes_speed`, `eta` |
 | `status`    | `phase` — `joining`, `merging`, `audio_<lang>`                    |
-| `done`      | `output_path` — the real path, `.mkv` if a remux happened         |
+| `done`      | `output_path` — always the requested path                         |
 | `error`     | `message`                                                         |
 | `cancelled` | —                                                                 |
 

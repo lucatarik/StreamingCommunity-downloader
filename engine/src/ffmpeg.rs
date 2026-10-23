@@ -80,6 +80,32 @@ fn tail(buf: &[u8]) -> String {
     format!("...{}", &trimmed[start..])
 }
 
+/// Whether `path` is written by the mov/mp4 muxer.
+///
+/// `movflags` is private to that muxer. Handed to Matroska, some ffmpeg builds
+/// refuse the whole command — at the end of a download, after every byte has
+/// been fetched — so it is added only where it means something.
+fn is_mp4(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+}
+
+/// Where the remux writes before replacing `output`.
+///
+/// The remux reads and writes the same extension, so it cannot write in place.
+/// A sibling rather than a file under the temp dir, because a rename cannot
+/// cross filesystems; dot-prefixed, so a Jellyfin scan running meanwhile does
+/// not index the half-written file as a second copy. The extension is kept:
+/// it is what tells ffmpeg which muxer to use.
+pub fn staging_path(output: &Path) -> PathBuf {
+    let name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    output.with_file_name(format!(".{name}"))
+}
+
 /// What the joined output is actually for, which decides how much work ffmpeg
 /// has to do.
 ///
@@ -185,7 +211,10 @@ async fn join_once(
         "pipe:0",
     ];
     args.extend_from_slice(codec_args);
-    args.extend_from_slice(&["-movflags", "+faststart", "-y", &output_str]);
+    if is_mp4(output) {
+        args.extend_from_slice(&["-movflags", "+faststart"]);
+    }
+    args.extend_from_slice(&["-y", &output_str]);
 
     let mut child = spawn(&args, "join")?;
 
@@ -335,9 +364,12 @@ fn remux_args(
         args.push(format!("{}:0", audio.len() + 1 + i));
     }
 
-    // Matroska carries WebVTT natively, so nothing needs re-encoding.
+    // Matroska carries WebVTT natively. MP4 has no WebVTT track type, so there
+    // the subtitles become 3GPP timed text — the only conversion anywhere: the
+    // picture and the sound are always copied.
+    let subtitle_codec = if is_mp4(output) { "mov_text" } else { "copy" };
     args.extend(
-        ["-c:v", "copy", "-c:a", "copy", "-c:s", "copy"]
+        ["-c:v", "copy", "-c:a", "copy", "-c:s", subtitle_codec]
             .iter()
             .map(|s| s.to_string()),
     );
@@ -361,30 +393,35 @@ fn remux_args(
         args.push(if forced { "forced".into() } else { "0".into() });
     }
 
+    if is_mp4(output) {
+        args.push("-movflags".into());
+        args.push("+faststart".into());
+    }
+
     args.push(output.to_string_lossy().into_owned());
     args
 }
 
-/// Remux video + external audio/subtitle tracks into a single `.mkv`.
+/// Remux external audio/subtitle tracks into `video`, keeping its container.
 ///
-/// Returns the path actually produced: the untouched input when there is
-/// nothing to add.
-pub async fn remux_to_mkv(
+/// The result replaces `video` only once ffmpeg has finished; until then the
+/// work happens in `staging_path(video)`. Nothing to add means nothing to do.
+pub async fn remux(
     video: &Path,
     audio: &[AudioTrack],
     subtitles: &[SubtitleTrack],
     cancel: &CancellationToken,
-) -> Result<PathBuf> {
+) -> Result<()> {
     if audio.is_empty() && subtitles.is_empty() {
-        return Ok(video.to_path_buf());
+        return Ok(());
     }
 
-    let output = video.with_extension("mkv");
+    let output = staging_path(video);
     let args = remux_args(video, audio, subtitles, &output);
     let borrowed: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
     tracing::info!(
-        "remux MKV: video + {} tracce audio + {} sottotitoli",
+        "remux: video + {} tracce audio + {} sottotitoli",
         audio.len(),
         subtitles.len()
     );
@@ -408,7 +445,6 @@ pub async fn remux_to_mkv(
         _ = cancel.cancelled() => {
             let _ = child.kill().await;
             let _ = stderr_task.await;
-            // A partial .mkv would be mistaken for the finished article.
             let _ = tokio::fs::remove_file(&output).await;
             return Err(EngineError::Cancelled);
         }
@@ -432,10 +468,8 @@ pub async fn remux_to_mkv(
         });
     }
 
-    if output != video {
-        let _ = tokio::fs::remove_file(video).await;
-    }
-    Ok(output)
+    tokio::fs::rename(&output, video).await.at(video)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -444,11 +478,26 @@ mod tests {
 
     fn args_of(audio: &[AudioTrack], subs: &[SubtitleTrack]) -> Vec<String> {
         remux_args(
+            Path::new("/lib/Film.mkv"),
+            audio,
+            subs,
+            Path::new("/lib/.Film.mkv"),
+        )
+    }
+
+    fn mp4_args_of(audio: &[AudioTrack], subs: &[SubtitleTrack]) -> Vec<String> {
+        remux_args(
             Path::new("/lib/Film.mp4"),
             audio,
             subs,
-            Path::new("/lib/Film.mkv"),
+            Path::new("/lib/.Film.mp4"),
         )
+    }
+
+    fn option_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
     }
 
     fn audio(language: &str) -> AudioTrack {
@@ -479,7 +528,29 @@ mod tests {
             .position(|a| a.starts_with("-metadata:s:"))
             .expect("there is metadata");
         assert!(first_metadata > last_input);
-        assert_eq!(args.last().map(String::as_str), Some("/lib/Film.mkv"));
+        assert_eq!(args.last().map(String::as_str), Some("/lib/.Film.mkv"));
+    }
+
+    /// Matroska takes WebVTT as-is and has no `movflags`; MP4 needs both the
+    /// timed-text conversion and the faststart flag.
+    #[test]
+    fn the_container_decides_the_subtitle_codec_and_the_muxer_flags() {
+        let mkv = args_of(&[], &[subtitle("ita")]);
+        assert_eq!(option_value(&mkv, "-c:s"), Some("copy"));
+        assert!(!mkv.contains(&"-movflags".to_string()), "{mkv:?}");
+
+        let mp4 = mp4_args_of(&[], &[subtitle("ita")]);
+        assert_eq!(option_value(&mp4, "-c:s"), Some("mov_text"));
+        assert_eq!(option_value(&mp4, "-movflags"), Some("+faststart"));
+        assert_eq!(mp4.last().map(String::as_str), Some("/lib/.Film.mp4"));
+    }
+
+    #[test]
+    fn staging_keeps_the_folder_and_the_extension_but_hides_the_file() {
+        assert_eq!(
+            staging_path(Path::new("/lib/Film (2020)/Film (2020).mkv")),
+            PathBuf::from("/lib/Film (2020)/.Film (2020).mkv")
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.requests import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from app import __version__, db, downloads_hooks, downloads_notify
+from app import __version__, config, db, downloads_hooks, downloads_notify, library, writable
 from app.auth import models as auth_models
 from app.auth import router as auth_router
 from app.auth import session as auth_session
@@ -23,9 +23,10 @@ from app.requests import router as requests_router, service as requests_service
 from app.watches import poller as watch_poller, router as watches_router
 from app.schedule import ScheduleStore
 from app.config import SCHEDULE_FILE
+from app.mcp import server as mcp_http
 from app.routers import (
     domain, search, home, tv, downloads, progress, files, images, anime, notification_channels,
-    metadata as metadata_router, download_hooks,
+    metadata as metadata_router, download_hooks, library as library_router, mcp as mcp_router,
 )
 
 logging.basicConfig(
@@ -85,8 +86,30 @@ class VersionedStaticFiles(StaticFiles):
         return response
 
 
+def _library_dirs() -> list[Path]:
+    """Every folder a download can land in: each configured library, plus
+    VIDEOS_DIR while some kind has none (it is the fallback, see jobs.py)."""
+    libraries = config.read_data().get("libraries", [])
+    dirs = {Path(lib["path"]) for lib in libraries if lib.get("path")}
+    if not {"film", "tv", "anime"} <= {lib.get("type") for lib in libraries}:
+        dirs.add(config.VIDEOS_DIR)
+    return sorted(dirs)
+
+
+def check_writable_paths() -> None:
+    """Fail at boot, not three retries into the first download (#28)."""
+    writable.check(
+        tmp_dir=config.TMP_DIR,
+        config_files=[db.current_path(), config.DATA_FILE, config.SCHEDULE_FILE],
+        library_dirs=_library_dirs(),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # First: a database the process cannot write fails migrations with SQLite's
+    # "unable to open database file", which names neither the path nor the uid.
+    check_writable_paths()
     db.run_migrations()
     auth_session.purge_expired()
     requests_service.register_job_listener()
@@ -96,6 +119,9 @@ async def lifespan(app: FastAPI):
     # Third and last: outbound side effects only, so it can neither delay a
     # request's own row nor swallow a notification if it fails.
     downloads_hooks.register_hook_listener()
+    # Files where each finished download went, under its title's id. Order does
+    # not matter: nothing else waits on it, and only the library check reads it.
+    library.register_job_listener()
     # Before anything can approve or complete a request: any row still
     # "approved" or "downloading" from a previous run has no in-memory worker
     # left, and never will — it needs recovering before the app is reachable.
@@ -112,7 +138,10 @@ async def lifespan(app: FastAPI):
     # never does network I/O.
     domain_task = asyncio.create_task(domain_recovery.domain_watch_loop())
     try:
-        yield
+        # Always running, whatever the switch says: the endpoint reads the
+        # switch per request, so turning MCP on or off needs no restart.
+        async with mcp_http.running():
+            yield
     finally:
         poller_task.cancel()
         domain_task.cancel()
@@ -136,6 +165,10 @@ app.include_router(domain.router)
 app.include_router(metadata_router.router)
 app.include_router(notification_channels.router)
 app.include_router(download_hooks.router)
+app.include_router(library_router.router)
+app.include_router(mcp_router.router)
+# Raw ASGI, outside FastAPI's routing: the MCP transport speaks JSON-RPC itself.
+app.add_route(mcp_http.PATH, mcp_http.endpoint, include_in_schema=False)
 app.include_router(watches_router.router)
 app.include_router(search.router)
 app.include_router(home.router)

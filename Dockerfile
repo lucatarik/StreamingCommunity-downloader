@@ -33,12 +33,16 @@ COPY --from=engine /build/target/release/sc-dl-engine /usr/local/bin/sc-dl-engin
 
 COPY . .
 
-# The container runs as the host user (see `user:` in docker-compose), not as
-# root, so downloaded files belong to whoever browses the library rather than
-# to root — which used to leave folders nobody but root could delete. That
-# means the app must be able to create its state files here as a non-root uid.
-# Only the directories it writes into are opened up, not every file in the tree.
-RUN mkdir -p /app/tmp /app/videos && chmod a+rwx /app /app/tmp /app/videos
+# Runs as root unless the compose file says `user:` (#28) — the local compose
+# does, so downloaded files belong to whoever browses the library rather than
+# to root. Everything above is root-owned, so the places the panel writes inside
+# the image itself are opened to any uid: tmp/ (TMP_DIR, HLS segments while a
+# job runs) and config/ (where the template points DB_FILE, DATA_FILE and
+# SCHEDULE_FILE, normally a volume that hides this one), both sticky like /tmp
+# so one uid cannot delete another's files. /app itself stays writable too: a
+# deployment without a config volume keeps panel.db and data.json there.
+RUN mkdir -p /app/tmp /app/config /app/videos && \
+    chmod a+rwx /app /app/videos && chmod 1777 /app/tmp /app/config
 
 # Fail at build time rather than on the first download if the binary did not
 # make it across.

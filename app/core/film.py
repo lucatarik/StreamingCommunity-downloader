@@ -15,6 +15,8 @@ from app.core._shared import (
     _parse_content,
     _get_m3u8_key,
     _get_m3u8_url,
+    embed_referer,
+    apply_video_host,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,8 +31,8 @@ def _get_iframe(id_title, domain):
     else:
         raise RuntimeError(f"Cannot fetch iframe: HTTP {req.status_code}")
 
-    url_embed = BeautifulSoup(req.text, "lxml").find("iframe").get("src")
-    # vixcloud.co /embed/ is behind Cloudflare — fetch via cloudscraper.
+    url_embed = apply_video_host(BeautifulSoup(req.text, "lxml").find("iframe").get("src"))
+    # The vixcloud /embed/ is behind Cloudflare — fetch via cloudscraper.
     script_text = _fetch_vixcloud_embed(url_embed, referer=f"https://{domain}/")
     logger.info("Embed script (first 800 chars): %s", script_text[:800])
     return script_text, url_embed
@@ -140,10 +142,7 @@ def get_film_languages(id_film: int, domain: str) -> dict:
     embed_content, url_embed = _get_iframe(id_film, domain)
     json_win_video, json_win_param = _parse_content(embed_content, url_embed)
     m3u8_url = _get_m3u8_url(json_win_video, json_win_param)
-    referer = (
-        f"https://vixcloud.co/embed/{json_win_video['id']}"
-        f"?token={json_win_param['token']}&expires={json_win_param['expires']}"
-    )
+    referer = embed_referer(json_win_video, json_win_param)
     langs = fetch_master_languages(m3u8_url, referer)
     explicit_lang = parse_qs(urlparse(url_embed).query).get("lang", [None])[0]
     langs["lang"] = explicit_lang
@@ -187,12 +186,17 @@ def download_film(id_film: int, title_name: str, domain: str,
     )
     subtitle_track_urls = _collect_subtitle_tracks(m3u8_url, embed_referer, subtitle_languages)
 
-    mp4_path = film_path(output_dir, title_name, year)
+    # A folder a person associated with this film wins over the name the
+    # templates would give it (app/library.py); None means there is none.
+    from app.library import destination
+
+    dest_path = (destination("film", id_film, root=output_dir, year=year, single_file=True)
+                 or film_path(output_dir, title_name, year))
 
     final_path = download_m3u8(
         m3u8_index=m3u8_url,
         key=m3u8_key,
-        output_filename=mp4_path,
+        output_filename=dest_path,
         temp_dir=temp_dir,
         progress_factory=progress_factory,
         referer=embed_referer,
@@ -203,5 +207,6 @@ def download_film(id_film: int, title_name: str, domain: str,
         subtitle_track_urls=subtitle_track_urls,
     )
 
-    # download_m3u8 returns the real output path (e.g. .mkv after remux)
-    return final_path or mp4_path
+    # download_m3u8 returns the real output path: the destination is built in
+    # whatever container is configured, and the remux keeps it.
+    return final_path or dest_path

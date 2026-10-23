@@ -11,8 +11,9 @@
 const _SETTINGS_FEEDBACK_IDS = [
   'domain-feedback', 'libraries-feedback', 'perf-settings-feedback',
   'jf-connect-feedback', 'jf-reconnect-feedback', 'notif-channels-feedback',
-  'domain-recovery-feedback',
+  'domain-recovery-feedback', 'hosts-feedback',
   'jf-refresh-feedback', 'hooks-feedback', 'naming-feedback',
+  'output-feedback', 'mcp-feedback',
 ];
 
 function _feedback(id, message = '', kind = 'muted') {
@@ -26,16 +27,20 @@ function _feedback(id, message = '', kind = 'muted') {
 // modal no longer waits on the slowest section (disk usage stats every library
 // path, on an NFS mount that can be asleep).
 const _SETTINGS_TAB_LOADERS = {
-  sorgente: () => loadDomainRecoverySettings(),
+  sorgente: () => Promise.all([loadDomainRecoverySettings(), loadHosts()]),
   // Loaded here rather than at boot. It was the one settings pane fed by a
   // prefetch the whole application waited on before it could show any page
   // at all, for data only this tab reads.
   librerie: () => loadLibraries().then(renderLibrariesList),
+  associazioni: () => loadLibraryAssociations(),
   nomi: () => loadNamingTemplates(),
-  download: () => loadPerfSettings(),
+  // Both read the same endpoint, and _loadAppSettings() shares the promise, so
+  // this is still one fetch.
+  download: () => Promise.all([loadPerfSettings(), loadOutputSettings()]),
   accesso: () => loadJellyfinSettings(),
   notifiche: () => loadNotificationChannels(),
   hook: () => Promise.all([loadJellyfinRefresh(), loadHooks()]),
+  mcp: () => loadMcpSettings(),
 };
 
 // Two panes read the same endpoint. Shared per modal-open so switching between
@@ -51,7 +56,7 @@ function _loadAppSettings() {
 
 // Tabs whose panes only talk to MANAGE_SETTINGS endpoints: without it they would
 // render as empty panes fed by 403s.
-const _SETTINGS_TABS_NEED_MANAGE = ['sorgente', 'librerie', 'nomi', 'download', 'notifiche', 'hook'];
+const _SETTINGS_TABS_NEED_MANAGE = ['sorgente', 'librerie', 'associazioni', 'nomi', 'download', 'notifiche', 'hook', 'mcp'];
 
 let _settingsTab = 'sorgente';
 const _settingsLoaded = new Set();
@@ -400,6 +405,39 @@ async function loadPerfSettings() {
     data.series_watch_interval_minutes ?? 240;
 }
 
+// ── Output format ─────────────────────────────────────────────
+//
+// The defaults are spelled in the markup's <option> values rather than fetched:
+// there are two of each and the server rejects anything else outright, so a
+// round trip would buy nothing. Unlike the naming templates, where the default
+// is a string the server owns and the placeholder has to be synced from it.
+
+async function loadOutputSettings() {
+  const data = await _loadAppSettings();
+  if (!data) return;
+  document.getElementById('setting-output-container').value = data.output_container || 'mkv';
+  document.getElementById('setting-subtitle-mode').value = data.subtitle_mode || 'embed';
+}
+
+async function saveOutputSettings() {
+  const btn = document.getElementById('save-output-btn');
+  const outputContainer = document.getElementById('setting-output-container').value;
+  const subtitleMode = document.getElementById('setting-subtitle-mode').value;
+  btn.disabled = true;
+  _feedback('output-feedback', 'Salvataggio...');
+  try {
+    // Only the two keys this section owns: set_app_settings merges over what is
+    // stored, so it cannot clobber a change made seconds ago in another pane.
+    await api.put('/api/domain/settings', {
+      output_container: outputContainer,
+      subtitle_mode: subtitleMode,
+    });
+    _feedback('output-feedback', 'Salvato.', 'success');
+    showToast('Formato di uscita salvato', 'success');
+  } catch (e) { _feedback('output-feedback', errText(e, 'Errore salvataggio.'), 'danger'); }
+  finally { btn.disabled = false; }
+}
+
 async function loadDomainRecoverySettings() {
   const data = await _loadAppSettings();
   if (!data) return;
@@ -410,6 +448,35 @@ async function loadDomainRecoverySettings() {
     data.domain_check_interval_minutes ?? 360;
 }
 
+
+// AnimeUnity's host and the video host override. A blank field means the
+// default, which the placeholder shows; the server reads "" as "reset".
+function _fillHosts(data) {
+  const au = document.getElementById('animeunity-host-input');
+  au.placeholder = data.animeunity_default;
+  au.value = data.animeunity_saved || '';
+  document.getElementById('video-host-input').value = data.video_host || '';
+}
+
+async function loadHosts() {
+  try { _fillHosts(await api.get('/api/domain/hosts')); } catch (e) { /* 403: tab hidden */ }
+}
+
+async function saveHosts() {
+  const btn = document.getElementById('save-hosts-btn');
+  btn.disabled = true;
+  _feedback('hosts-feedback', 'Verifica in corso...');
+  try {
+    const data = await api.put('/api/domain/hosts', {
+      animeunity: document.getElementById('animeunity-host-input').value.trim(),
+      video_host: document.getElementById('video-host-input').value.trim(),
+    });
+    _fillHosts(data);
+    _feedback('hosts-feedback', 'Salvato.', 'success');
+    showToast('Host salvati', 'success');
+  } catch (e) { _feedback('hosts-feedback', errText(e, 'Errore salvataggio.'), 'danger'); }
+  finally { btn.disabled = false; }
+}
 
 // ── Naming templates ───────────────────────────────────────────────────────────
 //
@@ -829,11 +896,130 @@ async function saveLibraries() {
 }
 
 
+// ── MCP server ───────────────────────────────────────────────────────────────
+
+// The address an MCP client should use: wherever this page was reached from,
+// which behind a reverse proxy is the public HTTPS name.
+function _mcpUrl(path) {
+  return `${window.location.origin}${path || '/mcp'}`;
+}
+
+function _renderMcpSnippet(path, token) {
+  const snippet = {
+    mcpServers: {
+      streamingcommunity: {
+        type: 'http',
+        url: _mcpUrl(path),
+        headers: { Authorization: `Bearer ${token || '<TOKEN>'}` },
+      },
+    },
+  };
+  document.getElementById('mcp-config-snippet').textContent = JSON.stringify(snippet, null, 2);
+}
+
+let _mcpPath = '/mcp';
+
+async function loadMcpSettings() {
+  _feedback('mcp-feedback', '');
+  try {
+    const status = await api.get('/api/mcp/status');
+    _mcpPath = status.path;
+    document.getElementById('setting-mcp-enabled').checked = !!status.enabled;
+    const tokenStatus = document.getElementById('mcp-token-status');
+    if (!status.has_token) {
+      tokenStatus.textContent = 'Nessun token: genera un token perché un agente possa collegarsi.';
+    } else if (!status.owner) {
+      // Owner disabled or removed, or minted before Jellyfin was connected.
+      tokenStatus.textContent = 'Il token non è più valido: chi l’ha generato non è più un utente attivo. Generane uno nuovo.';
+    } else {
+      tokenStatus.textContent = `Token attivo, generato da ${status.owner}: l’agente agisce con i suoi permessi.`;
+    }
+    document.getElementById('mcp-revoke-btn').style.display = status.has_token ? '' : 'none';
+    document.getElementById('mcp-token-once').style.display = 'none';
+    _renderMcpSnippet(_mcpPath, '');
+  } catch (e) {
+    _feedback('mcp-feedback', errText(e, 'Errore nel caricamento.'), 'danger');
+  }
+}
+
+async function saveMcpSettings() {
+  const btn = document.getElementById('save-mcp-btn');
+  btn.disabled = true;
+  _feedback('mcp-feedback', 'Salvataggio...');
+  try {
+    await api.put('/api/domain/settings', {
+      mcp_enabled: document.getElementById('setting-mcp-enabled').checked,
+    });
+    _appSettingsPromise = null;
+    _feedback('mcp-feedback', 'Salvato.', 'success');
+    showToast('Impostazione salvata', 'success');
+  } catch (e) { _feedback('mcp-feedback', errText(e, 'Errore salvataggio.'), 'danger'); }
+  finally { btn.disabled = false; }
+}
+
+async function regenerateMcpToken() {
+  const hadToken = document.getElementById('mcp-revoke-btn').style.display !== 'none';
+  if (hadToken && !await scConfirm(
+    'Generare un nuovo token? Quello attuale smette subito di funzionare: '
+    + 'gli agenti che lo usano vanno riconfigurati.'
+  )) return;
+  try {
+    const res = await api.post('/api/mcp/token', {});
+    await loadMcpSettings();
+    document.getElementById('mcp-token-display').value = res.token;
+    document.getElementById('mcp-token-once').style.display = '';
+    _renderMcpSnippet(_mcpPath, res.token);
+  } catch (e) {
+    _feedback('mcp-feedback', errText(e, 'Errore nella generazione del token.'), 'danger');
+  }
+}
+
+async function revokeMcpToken() {
+  if (!await scConfirm(
+    'Revocare il token? Nessun agente potrà collegarsi finché non ne generi uno nuovo.'
+  )) return;
+  try {
+    await api.del('/api/mcp/token');
+    await loadMcpSettings();
+    showToast('Token revocato', 'success');
+  } catch (e) {
+    _feedback('mcp-feedback', errText(e, 'Errore nella revoca.'), 'danger');
+  }
+}
+
+// The clipboard API exists only in a secure context, and a panel reached at
+// http://192.168.x.x is not one: there the selection-and-execCommand route is
+// the only one left.
+async function _copyText(text) {
+  if (!text) return false;
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); return true; } catch (_) { /* fall through */ }
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+  document.body.removeChild(ta);
+  return ok;
+}
+
+async function _copyWithToast(text, what) {
+  const ok = await _copyText(text);
+  showToast(ok ? `${what} copiato` : 'Impossibile copiare: selezionalo a mano', ok ? 'success' : 'warning');
+}
+
+
 // ── Delegated handlers ───────────────────────────────────────────────────────
 
 registerActions({
   'settings:open':        () => openSettings(),
   'cfg:saveDomain':       () => saveDomain(),
+  'cfg:saveHosts':        () => saveHosts(),
   'cfg:saveRecovery':     () => saveDomainRecovery(),
   'cfg:checkDomain':      () => checkDomainNow(),
   'cfg:addLibrary':       () => addLibrary(),
@@ -842,6 +1028,7 @@ registerActions({
   'cfg:saveNaming':       () => saveNamingTemplates(),
   'cfg:resetNaming':      () => resetNamingTemplates(),
   'cfg:savePerf':         () => savePerfSettings(),
+  'cfg:saveOutput':       () => saveOutputSettings(),
   'cfg:jfConnect':        d => connectJellyfin(d.reconfigure === '1'),
   'cfg:jfReconfigure':    () => toggleJellyfinReconfigure(),
   'cfg:saveJfRefresh':    () => saveJellyfinRefresh(),
@@ -858,6 +1045,11 @@ registerActions({
   'cfg:hookEnabled':      (d, el) => toggleHook(Number(d.id), el.checked),
   'cfg:testHook':         d => testHook(Number(d.id)),
   'cfg:deleteHook':       d => deleteHook(Number(d.id)),
+  'cfg:saveMcp':          () => saveMcpSettings(),
+  'cfg:copyMcpToken':     () => _copyWithToast(document.getElementById('mcp-token-display').value, 'Token'),
+  'cfg:copyMcpSnippet':   () => _copyWithToast(document.getElementById('mcp-config-snippet').textContent, 'Configurazione'),
+  'cfg:regenerateMcpToken': () => regenerateMcpToken(),
+  'cfg:revokeMcpToken':   () => revokeMcpToken(),
 });
 
 

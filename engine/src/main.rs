@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{EngineError, Result};
 use crate::progress::{EventSink, Progress};
-use crate::spec::{Event, JobSpec, exit};
+use crate::spec::{Event, JobSpec, SubtitleMode, exit};
 
 const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
@@ -159,7 +159,7 @@ async fn read_spec() -> std::result::Result<JobSpec, String> {
 }
 
 /// The whole download, start to finish. Returns the final output path, which
-/// may differ from the requested one when a remux changes the container.
+/// is the requested one: the container is the panel's choice, not the engine's.
 async fn run(spec: &JobSpec, sink: &EventSink, cancel: &CancellationToken) -> Result<String> {
     let temp_dir = PathBuf::from(&spec.temp_dir);
     let output_path = PathBuf::from(&spec.output_path);
@@ -280,19 +280,24 @@ async fn run(spec: &JobSpec, sink: &EventSink, cancel: &CancellationToken) -> Re
     }
 
     // ── Final container ────────────────────────────────────────────────────
-    let final_path = if audio_tracks.is_empty() && subtitle_tracks.is_empty() {
-        output_path.clone()
-    } else {
+    // Subtitles kept outside the container are not a merge, only a move, so
+    // with no audio renditions there is nothing to announce or remux.
+    let embedded: &[ffmpeg::SubtitleTrack] = match spec.subtitle_mode {
+        SubtitleMode::Embed => &subtitle_tracks,
+        SubtitleMode::External => &[],
+    };
+    if !audio_tracks.is_empty() || !embedded.is_empty() {
         sink.status("merging");
-        let path = ffmpeg::remux_to_mkv(&output_path, &audio_tracks, &subtitle_tracks, cancel)
-            .await?;
+        ffmpeg::remux(&output_path, &audio_tracks, embedded, cancel).await?;
         // The subtitles are inside the container now; leaving the sidecars
         // behind would make Jellyfin show every track twice.
-        for track in &subtitle_tracks {
+        for track in embedded {
             let _ = tokio::fs::remove_file(&track.path).await;
         }
-        path
-    };
+    }
+    if spec.subtitle_mode == SubtitleMode::External {
+        place_beside(&subtitle_tracks, &output_path).await;
+    }
 
     // Only a completed download may clear its scratch space. A failed one keeps
     // it, which is precisely what lets the next attempt resume.
@@ -300,7 +305,35 @@ async fn run(spec: &JobSpec, sink: &EventSink, cancel: &CancellationToken) -> Re
         tracing::warn!("cartella temporanea non rimossa ({}): {e}", temp_dir.display());
     }
 
-    Ok(final_path.to_string_lossy().into_owned())
+    Ok(output_path.to_string_lossy().into_owned())
+}
+
+/// Move the sidecars next to the finished video, Jellyfin's own convention.
+///
+/// Moved at the end rather than downloaded straight there: written into the
+/// library up front they would sit beside a video that does not exist yet, and
+/// a scan running mid-download would index a title whose only content is
+/// subtitles. Best effort, like every subtitle step: the video is what was
+/// asked for. Must run before the temp dir is cleared, which is where they are.
+async fn place_beside(tracks: &[ffmpeg::SubtitleTrack], video: &Path) {
+    let Some(dir) = video.parent() else { return };
+    for track in tracks {
+        let Some(name) = track.path.file_name() else { continue };
+        let target = dir.join(name);
+        // A rename cannot cross filesystems, and in Docker the temp dir and the
+        // library routinely are different ones.
+        let moved = match tokio::fs::rename(&track.path, &target).await {
+            Ok(()) => Ok(()),
+            Err(_) => match tokio::fs::copy(&track.path, &target).await {
+                Ok(_) => tokio::fs::remove_file(&track.path).await,
+                Err(e) => Err(e),
+            },
+        };
+        match moved {
+            Ok(()) => tracing::info!("sottotitolo accanto al video: {}", target.display()),
+            Err(e) => tracing::warn!("sottotitolo {} non spostato: {e}", target.display()),
+        }
+    }
 }
 
 /// Merge the subtitle playlists the panel resolved with those the master
@@ -346,10 +379,9 @@ async fn resolve_subtitle_specs(
 /// Delete a half-written output so nothing downstream mistakes it for a
 /// finished file. Segment scratch space is deliberately left alone.
 async fn cleanup_partial_output(output_path: &Path) {
-    for candidate in [
-        output_path.to_path_buf(),
-        output_path.with_extension("mkv"),
-    ] {
+    // Never the same title in the other container: that is a finished file
+    // from an earlier setting, not something this attempt wrote.
+    for candidate in [output_path.to_path_buf(), ffmpeg::staging_path(output_path)] {
         if tokio::fs::remove_file(&candidate).await.is_ok() {
             tracing::info!("rimosso output parziale: {}", candidate.display());
         }

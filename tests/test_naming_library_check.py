@@ -26,6 +26,11 @@ from tests.conftest import do_setup, make_user, session_for
 # These strings are the layout as it shipped. They are written out literally
 # rather than computed, so that a change to the engine has to come here and
 # argue with a human instead of quietly agreeing with itself.
+#
+# container="mp4" is passed explicitly rather than left to the setting. The
+# extension is a setting now, and what these anchor is the folder and the stem
+# — the parts the templates own. Which container the default picks is asserted
+# once, on its own, by test_the_default_container_decides_the_extension.
 
 @pytest.mark.parametrize(
     "kwargs, expected",
@@ -39,7 +44,8 @@ from tests.conftest import do_setup, make_user, session_for
     ],
 )
 def test_film_paths_are_unchanged(kwargs, expected):
-    assert paths.film_path("/lib", **kwargs) == os.path.join("/lib", *expected.split("/"))
+    assert paths.film_path("/lib", **kwargs, container="mp4") == os.path.join(
+        "/lib", *expected.split("/"))
 
 
 @pytest.mark.parametrize(
@@ -58,7 +64,8 @@ def test_film_paths_are_unchanged(kwargs, expected):
     ],
 )
 def test_episode_paths_are_unchanged(kwargs, expected):
-    assert paths.episode_path("/lib", **kwargs) == os.path.join("/lib", *expected.split("/"))
+    assert paths.episode_path("/lib", **kwargs, container="mp4") == os.path.join(
+        "/lib", *expected.split("/"))
 
 
 @pytest.mark.parametrize(
@@ -71,7 +78,42 @@ def test_episode_paths_are_unchanged(kwargs, expected):
     ],
 )
 def test_anime_paths_are_unchanged(kwargs, expected):
-    assert paths.anime_path("/lib", **kwargs) == os.path.join("/lib", *expected.split("/"))
+    assert paths.anime_path("/lib", **kwargs, container="mp4") == os.path.join(
+        "/lib", *expected.split("/"))
+
+
+@pytest.mark.parametrize("anime_type", ["TV", "ONA", "OVA", "Special", "TV Short", None])
+def test_every_anime_kind_but_movie_is_a_series(anime_type):
+    """An ONA used to take the film path: every episode wrote one file over the last."""
+    assert paths.is_anime_series(anime_type)
+    first = paths.anime_path("/lib", "Whale", "1", anime_type, container="mp4")
+    second = paths.anime_path("/lib", "Whale", "2", anime_type, container="mp4")
+    assert first == os.path.join("/lib", "Whale", "Season 01", "Whale S01E01.mp4")
+    assert second == os.path.join("/lib", "Whale", "Season 01", "Whale S01E02.mp4")
+
+
+@pytest.mark.parametrize("anime_type", ["Movie", "movie", "film", "Film"])
+def test_only_a_film_kind_is_a_film(anime_type):
+    assert not paths.is_anime_series(anime_type)
+
+
+def test_the_frontend_names_the_same_film_kinds():
+    """isAnimeFilm() in core.js mirrors _ANIME_FILM_KINDS; a kind added to one
+    and not the other would hide "Segui" on a series, or offer it on a film."""
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).parent.parent / "app" / "static" / "core.js").read_text()
+    body = re.search(r"function isAnimeFilm\(kind\) \{(.*?)\n\}", source, re.S).group(1)
+    listed = re.search(r"\[([^\]]*)\]", body).group(1)
+    assert set(re.findall(r"'([^']+)'", listed)) == set(paths._ANIME_FILM_KINDS)
+
+
+def test_the_default_container_decides_the_extension():
+    """The one thing the anchors above deliberately stop asserting."""
+    assert paths.film_path("/lib", "Blade Runner", "1982").endswith(".mkv")
+    assert paths.episode_path("/lib", "Dark", 1, "7", "2017").endswith(".mkv")
+    assert paths.anime_path("/lib", "Naruto", "12", year="2002").endswith(".mkv")
 
 
 def test_the_legacy_templates_produce_the_same_paths_as_the_defaults():
@@ -95,7 +137,8 @@ CUSTOM = {**naming.DEFAULT_TEMPLATES,
 
 
 def test_a_custom_template_changes_the_path():
-    result = paths.episode_path("/lib", "Dark", 1, "7", "2017", templates=CUSTOM)
+    result = paths.episode_path("/lib", "Dark", 1, "7", "2017", templates=CUSTOM,
+                                container="mp4")
     assert result == os.path.join("/lib", "Dark (2017)", "Stagione 1", "Dark 1x07.mp4")
 
 
@@ -171,17 +214,165 @@ def test_the_current_template_wins_over_a_legacy_leftover(library):
 
 
 def test_the_mkv_sibling_is_found(library):
-    """Almost every download ends as .mkv: the path is built as .mp4 regardless."""
+    """A file in the other container still counts as present.
+
+    The container is a setting, so anything downloaded before it was changed
+    carries the other extension. Missing it would re-download a title that is
+    already there and leave two copies side by side.
+    """
     mkv = _write(str(library / "Dark (2017)" / "Season 01" / "Dark S01E07.mkv"))
     assert resolver.existing_file(_request()) == mkv
+
+
+def test_the_other_container_is_found_too(library, monkeypatch):
+    """The same, from the other side: configured mp4, an old mkv on disk."""
+    from app import config
+    config.save_settings({**config.get_settings(), "output_container": "mp4"})
+
+    mp4 = _write(str(library / "Dark (2017)" / "Season 01" / "Dark S01E07.mp4"))
+    assert resolver.existing_file(_request()) == mp4
 
 
 def test_nothing_on_disk_is_nothing(library):
     assert resolver.existing_file(_request()) is None
 
 
+# ── One series, several year folders (#24) ──────────────────────────────────
+#
+# Before #21 a series' folder was named after its latest season's year, and
+# before that after no year at all, so one series can sit in three folders.
+
+def _simpsons(library, folder, episode):
+    return _write(str(library / folder / "Season 10" / f"I Simpson S10E{episode:02d}.mkv"))
+
+
+def _simpsons_request(**overrides):
+    return _request(**{"title": "I Simpson", "year": "1989", "season": 10, **overrides})
+
+
+def test_an_episode_in_a_later_years_folder_counts(library):
+    stray = _simpsons(library, "I Simpson (2025)", 4)
+    assert resolver.existing_file(_simpsons_request(episode_number="4")) == stray
+
+
+def test_an_episode_in_the_yearless_folder_counts(library):
+    stray = _simpsons(library, "I Simpson", 1)
+    assert resolver.existing_file(_simpsons_request(episode_number="1")) == stray
+
+
+def test_the_canonical_folder_wins_over_a_stray_one(library):
+    _simpsons(library, "I Simpson (2026)", 2)
+    canonical = _simpsons(library, "I Simpson (1989)", 2)
+    assert resolver.existing_file(_simpsons_request(episode_number="2")) == canonical
+
+
+def test_a_new_episode_joins_the_folder_the_series_is_in(library):
+    """#24: a new canonical folder next to the real one is a second series in
+    Jellyfin, holding one episode."""
+    _simpsons(library, "I Simpson (2025)", 1)
+    assert "I Simpson (2025)" in resolver.destination_path(_simpsons_request(episode_number="5"))
+
+
+def test_the_folder_holding_the_season_wins_over_a_stray_episode(library):
+    """Ted Lasso: the whole series in (2026), one episode already sent to the
+    canonical (2020). The next one goes where the season is, not where the
+    stray landed."""
+    for n in range(1, 9):
+        _write(str(library / "Ted Lasso (2026)" / "Season 04" / f"Ted Lasso S04E{n:02d}.mkv"))
+    _write(str(library / "Ted Lasso (2020)" / "Season 04" / "Ted Lasso S04E09.mkv"))
+    request = _request(title="Ted Lasso", year="2020", season=4, episode_number="10")
+
+    assert resolver.destination_path(request) == str(
+        library / "Ted Lasso (2026)" / "Season 04" / "Ted Lasso S04E10.mkv")
+
+
+def test_on_a_tie_the_canonical_folder_wins(library):
+    _simpsons(library, "I Simpson (1989)", 1)
+    _simpsons(library, "I Simpson (2025)", 2)
+    assert "I Simpson (1989)" in resolver.destination_path(_simpsons_request(episode_number="5"))
+
+
+def test_an_empty_year_folder_does_not_attract_downloads(library):
+    (library / "I Simpson (2025)").mkdir()
+    assert "I Simpson (1989)" in resolver.destination_path(_simpsons_request(episode_number="5"))
+
+
+def test_a_rejected_folder_is_never_the_destination(client, library):
+    from app import library as registry
+
+    _simpsons(library, "I Simpson (2025)", 1)
+    registry.record("streamingcommunity", "episode", "1", "I Simpson (2025)", "rejected")
+    assert "I Simpson (1989)" in resolver.destination_path(_simpsons_request(episode_number="5"))
+
+
+def test_the_download_lands_where_the_check_looks(library):
+    """The downloader builds its path through the same function, so the next
+    check finds the file it just wrote."""
+    _simpsons(library, "I Simpson (2025)", 1)
+    written = resolver.series_episode_path("episode", "1", str(library), "I Simpson", 10, "5", "1989")
+    _write(written)
+    assert resolver.existing_file(_simpsons_request(episode_number="5")) == written
+
+
+def test_an_earlier_year_is_a_different_series(library):
+    """A wrong year was always a later season's. An earlier one is a remake's
+    original, and it must not satisfy the remake."""
+    _write(str(library / "Shogun (1980)" / "Season 01" / "Shogun S01E01.mkv"))
+    request = _request(title="Shogun", year="2024", season=1, episode_number="1")
+    assert resolver.existing_file(request) is None
+
+
+def test_a_longer_title_is_a_different_series(library):
+    _write(str(library / "I Simpson Show (2025)" / "Season 10" / "I Simpson S10E01.mkv"))
+    assert resolver.existing_file(_simpsons_request(episode_number="1")) is None
+
+
+def test_with_no_year_known_every_year_folder_counts(library):
+    stray = _simpsons(library, "I Simpson (2025)", 3)
+    assert resolver.existing_file(_simpsons_request(year=None, episode_number="3")) == stray
+
+
+def test_a_custom_folder_template_is_matched_by_rendering_it(library):
+    from app import config
+    config.save_settings({**config.get_settings(), "naming_templates": {
+        "series_folder": "{title}[ - {year}]",
+    }})
+    stray = _simpsons(library, "I Simpson - 2025", 6)
+    assert resolver.existing_file(_simpsons_request(episode_number="6")) == stray
+
+
+def test_the_episode_list_sees_the_union_of_the_folders(library):
+    """The issue's own example: seasons split across folders, all present."""
+    from app.routers.tv import _mark_in_library
+
+    for n in (1, 2, 3):
+        _simpsons(library, "I Simpson", n)
+    for n in (4, 5):
+        _simpsons(library, "I Simpson (2025)", n)
+    (library / "I Simpson (2026)").mkdir()
+    episodes = [{"n": str(n)} for n in range(1, 7)]
+
+    _mark_in_library(episodes, "I Simpson", 10, "1989")
+
+    assert [e["in_library"] for e in episodes] == [True] * 5 + [False]
+
+
+def test_an_unlistable_library_degrades_to_the_canonical_folder(library, monkeypatch):
+    def refuse(path):
+        raise PermissionError(path)
+    monkeypatch.setattr(os, "scandir", refuse)
+
+    assert resolver.series_years(str(library), "I Simpson", "1989") == ["1989"]
+
+
 def test_the_default_configuration_costs_no_extra_stats(library, monkeypatch):
-    """The dedup must collapse the cross product back to what it always was."""
+    """The dedup must collapse the cross product back to what it always was.
+
+    Two axes, one stat each: the naming template (current and legacy, identical
+    under the defaults) and the container (one per known container). A third
+    container, or a third extension probed per container, has to come here and
+    argue with a human before it multiplies the stats on every library check.
+    """
     checked = []
     real_exists = os.path.exists
     monkeypatch.setattr(
@@ -266,3 +457,24 @@ def test_an_unknown_slot_in_a_preview_is_ignored(client, admin):
         "templates": {"nonsense": "{title}"},
     }).json()
     assert body["slots"] == {}
+
+
+def test_an_anime_series_joins_its_folder_too(library):
+    _write(str(library / "Naruto (2010)" / "Season 01" / "Naruto S01E01.mkv"))
+    request = _request(source="animeunity", media_type="anime", external_id="5",
+                       title="Naruto", year="2002", season=None, episode_number="2",
+                       anime_type="tv")
+    assert "Naruto (2010)" in resolver.destination_path(request)
+
+
+@pytest.mark.parametrize("sent, is_film", [
+    ("ONA", False), ("Movie", True), ("Film", True), (" TV Short ", False), ("", False), (None, False),
+])
+def test_a_request_accepts_the_sources_own_anime_kind(sent, is_film):
+    """The old allowlist answered 422 to "ONA" — and to "Movie", which the title page sends."""
+    from app.requests.router import CreateRequest
+
+    body = CreateRequest(source="animeunity", media_type="anime", external_id="1",
+                         title="Whale", anime_type=sent)
+    assert body.anime_type == sent
+    assert paths.is_anime_series(body.anime_type) is not is_film

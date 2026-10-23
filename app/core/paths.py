@@ -17,6 +17,7 @@ import os
 import re
 
 from app.core import naming
+from app.core.container import extension as _container_extension
 from app.core.headers import sanitize_filename
 
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -138,6 +139,19 @@ def _templates(overrides: dict | None) -> dict:
     return overrides if overrides is not None else naming.templates()
 
 
+def _extension(override: str | None) -> str:
+    """The container suffix, defaulting to the configured one.
+
+    Same shape as ``_templates`` above and for the same reason: the library
+    check has to be able to ask "where would this have landed under the *other*
+    container?" without a second copy of the layout.
+
+    The function is imported rather than the module, so the ``container=``
+    parameter the three builders take cannot shadow it.
+    """
+    return _container_extension(override)
+
+
 def _values(title: str, year=None, season=None, episode=None) -> dict:
     values = {"title": title, "year": "" if year in (None, "", 0) else str(year)}
     if season is not None:
@@ -149,18 +163,32 @@ def _values(title: str, year=None, season=None, episode=None) -> dict:
     return values
 
 
-def film_path(output_dir: str, title: str, year=None, templates: dict | None = None) -> str:
-    """videos/Title (YYYY)/Title (YYYY).mp4, or whatever the templates say."""
+def film_path(output_dir: str, title: str, year=None, templates: dict | None = None,
+              container: str | None = None) -> str:
+    """videos/Title (YYYY)/Title (YYYY).mkv, or whatever the settings say."""
     tpl = _templates(templates)
     values = _values(clean_title(title), year)
     folder = naming.render("film_folder", tpl.get("film_folder"), values)
     stem = naming.render("film_file", tpl.get("film_file"), values)
-    return os.path.join(output_dir, folder, stem + ".mp4")
+    return os.path.join(output_dir, folder, stem + _extension(container))
+
+
+def series_folder(tv_name: str, year=None, templates: dict | None = None) -> str:
+    """The series' own folder name, the first component of ``episode_path``.
+
+    Separate so the library check can ask "what would this series' folder be
+    called under year X?" and compare it with a directory listing, without
+    building a whole episode path to take it apart again.
+    """
+    tpl = _templates(templates)
+    values = _values(sanitize_filename(tv_name), year)
+    return naming.render("series_folder", tpl.get("series_folder"), values)
 
 
 def episode_path(output_dir: str, tv_name: str, season: int, episode_number,
-                 year=None, templates: dict | None = None) -> str:
-    """videos/Series (YYYY)/Season 01/Series S01E01.mp4, or whatever the templates say.
+                 year=None, templates: dict | None = None,
+                 container: str | None = None) -> str:
+    """videos/Series (YYYY)/Season 01/Series S01E01.mkv, or whatever the settings say.
 
     The title is sanitised rather than cleaned, unlike films and anime: a series
     called "Law, Order" keeps its comma here and would lose it there. That
@@ -169,31 +197,102 @@ def episode_path(output_dir: str, tv_name: str, season: int, episode_number,
     """
     tpl = _templates(templates)
     values = _values(sanitize_filename(tv_name), year, season, episode_number)
-    folder = naming.render("series_folder", tpl.get("series_folder"), values)
+    folder = series_folder(tv_name, year, tpl)
     season_folder = naming.render("season_folder", tpl.get("season_folder"), values)
     stem = naming.render("episode_file", tpl.get("episode_file"), values)
-    return os.path.join(output_dir, folder, season_folder, stem + ".mp4")
+    return os.path.join(output_dir, folder, season_folder, stem + _extension(container))
+
+
+def anime_folder(anime_name: str, year=None, templates: dict | None = None) -> str:
+    """The anime's own folder name, the first component of ``anime_path``."""
+    tpl = _templates(templates)
+    values = _values(clean_title(anime_name), year)
+    return naming.render("anime_folder", tpl.get("anime_folder"), values)
+
+
+# "film" is not a word AnimeUnity uses; it is here for API and MCP callers.
+# isAnimeFilm() in app/static/core.js holds the same list.
+_ANIME_FILM_KINDS = frozenset({"movie", "film"})
 
 
 def is_anime_series(anime_type: str) -> bool:
-    return (anime_type or "tv").lower() in ("tv", "serie", "series", "anime")
+    """Everything but a film is a series.
+
+    ``anime_type`` is AnimeUnity's own ``media_type`` (Movie/TV/OVA/ONA/Special,
+    and a long tail like "TV Short"), so the film is what has to be named: listing
+    the series kinds instead sent every ONA down the single-file path, and each
+    episode overwrote the last under one episode-less name.
+    """
+    return (anime_type or "tv").strip().lower() not in _ANIME_FILM_KINDS
 
 
 def anime_path(output_dir: str, anime_name: str, episode_number,
-               anime_type: str = "tv", year=None, templates: dict | None = None) -> str:
-    """Series: .../Name (YYYY)/Season 01/Name S01E01.mp4 — movies: .../Name (YYYY)/Name.mp4"""
+               anime_type: str = "tv", year=None, templates: dict | None = None,
+               container: str | None = None) -> str:
+    """Series: .../Name (YYYY)/Season 01/Name S01E01.mkv — movies: .../Name (YYYY)/Name.mkv"""
     tpl = _templates(templates)
     # AnimeUnity has no season number: everything is season 1, which is what the
     # default templates hardcode and why {season} is still offered here.
     values = _values(clean_title(anime_name), year, 1, episode_number)
-    folder = naming.render("anime_folder", tpl.get("anime_folder"), values)
+    folder = anime_folder(anime_name, year, tpl)
 
     if is_anime_series(anime_type):
         season_folder = naming.render(
             "anime_season_folder", tpl.get("anime_season_folder"), values
         )
         stem = naming.render("anime_episode_file", tpl.get("anime_episode_file"), values)
-        return os.path.join(output_dir, folder, season_folder, stem + ".mp4")
+        return os.path.join(output_dir, folder, season_folder, stem + _extension(container))
 
     stem = naming.render("anime_movie_file", tpl.get("anime_movie_file"), values)
-    return os.path.join(output_dir, folder, stem + ".mp4")
+    return os.path.join(output_dir, folder, stem + _extension(container))
+
+
+# ── Inside a folder chosen by hand ────────────────────────────────────────────
+#
+# A folder associated with a title by a person (app/library.py) decides where
+# that title's files go, and it may be shared: an anime split into parts at the
+# source, gathered into one series. The folder is given rather than rendered,
+# and the title the files are named after is the folder's own, so every part
+# of a shared series is named alike. Everything below the folder still comes
+# from the templates. These are the only builders for that layout: the library
+# check and the download both go through them, so the two cannot disagree
+# about where an episode is.
+
+_TRAILING_YEAR_RE = re.compile(r"\s*\(\d{4}\)\s*$")
+
+
+def folder_title(folder: str) -> str:
+    """``L'attacco dei giganti (2013)`` → ``L'attacco dei giganti``."""
+    return _TRAILING_YEAR_RE.sub("", folder).strip() or folder
+
+
+def placed_episode_path(folder_path: str, season: int, episode_number,
+                        anime: bool = False, templates: dict | None = None,
+                        container: str | None = None) -> str:
+    """``folder/Season 03/Title S03E13.mkv``, numbers already shifted.
+
+    An anime keeps its own templates while it is season 1, which is all they
+    were written for — ``anime_season_folder`` defaults to a literal "Season
+    01". Placed in any other season it takes the series templates, which is
+    the only way its season number reaches the folder name.
+    """
+    tpl = _templates(templates)
+    title = folder_title(os.path.basename(os.path.normpath(folder_path)))
+    values = _values(title, None, season, episode_number)
+    if anime and int(season) == 1:
+        season_slot, file_slot = "anime_season_folder", "anime_episode_file"
+    else:
+        season_slot, file_slot = "season_folder", "episode_file"
+    season_folder = naming.render(season_slot, tpl.get(season_slot), values)
+    stem = naming.render(file_slot, tpl.get(file_slot), values)
+    return os.path.join(folder_path, season_folder, stem + _extension(container))
+
+
+def placed_single_path(folder_path: str, year=None, anime: bool = False,
+                       templates: dict | None = None, container: str | None = None) -> str:
+    """``folder/Title (YYYY).mkv`` for a film, ``folder/Title.mkv`` for an anime film."""
+    tpl = _templates(templates)
+    title = folder_title(os.path.basename(os.path.normpath(folder_path)))
+    slot = "anime_movie_file" if anime else "film_file"
+    stem = naming.render(slot, tpl.get(slot), _values(title, year))
+    return os.path.join(folder_path, stem + _extension(container))

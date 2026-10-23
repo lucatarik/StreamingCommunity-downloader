@@ -32,7 +32,9 @@ pub struct JobSpec {
     #[serde(default)]
     pub referer: Option<String>,
 
-    /// Final destination. May come back as `.mkv` if a remux happens.
+    /// Final destination. Its extension is the container (`.mkv` or `.mp4`),
+    /// chosen by the panel's `output_container` setting; the engine never
+    /// changes it, so `Done.output_path` is always this path.
     pub output_path: String,
 
     /// Scratch space. Segments live here and are deliberately *kept* on
@@ -51,6 +53,11 @@ pub struct JobSpec {
     #[serde(default)]
     pub subtitle_languages: Vec<String>,
 
+    /// Whether subtitles go inside the container or beside it as
+    /// `<stem>.<lang>.vtt`, Jellyfin's sidecar convention.
+    #[serde(default)]
+    pub subtitle_mode: SubtitleMode,
+
     #[serde(default = "default_workers")]
     pub max_segment_workers: usize,
 
@@ -63,6 +70,14 @@ pub struct JobSpec {
     /// to a bare PATH lookup here would quietly diverge from that.
     #[serde(default)]
     pub ffmpeg_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtitleMode {
+    #[default]
+    Embed,
+    External,
 }
 
 #[derive(Debug, Clone, Deserialize)]

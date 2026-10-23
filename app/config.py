@@ -94,6 +94,14 @@ SETTINGS_DEFAULTS = {
     # Ask Jellyfin to scan when a download lands, instead of waiting for its
     # own schedule. Inert unless Jellyfin is connected.
     "jellyfin_refresh_on_download": False,
+    # The container every download is written into, and whether subtitles are
+    # muxed in or left beside the video as .vtt. The vocabulary and the
+    # fallbacks live in app.core.container, which is the only thing that reads
+    # these — app.config must not import app.core.
+    "output_container": "mkv",
+    "subtitle_mode": "embed",
+    # The MCP endpoint at /mcp. Off by default: it lets an agent act as a user.
+    "mcp_enabled": False,
 }
 
 
@@ -113,6 +121,29 @@ def configured_domain() -> str:
     user make the server issue HTTP requests to a host of their choosing.
     """
     return (read_data().get("domain") or "").strip()
+
+
+# Where AnimeUnity lives unless an administrator says otherwise. The source moves
+# TLD (.so to .to); Settings › Sorgente overrides it without a release, and the
+# ANIMEUNITY_HOST env var still works for deployments that set it.
+ANIMEUNITY_DEFAULT_HOST = "www.animeunity.to"
+
+
+def configured_animeunity_host() -> str:
+    """AnimeUnity's host: the saved one, then ANIMEUNITY_HOST, then the default."""
+    return ((read_data().get("animeunity_domain") or "").strip()
+            or os.getenv("ANIMEUNITY_HOST", "").strip()
+            or ANIMEUNITY_DEFAULT_HOST)
+
+
+def configured_video_host() -> str:
+    """A manual override for the video host, or "" to follow the embed URL.
+
+    Empty is the normal state: the host is read off the embed URL the source
+    hands over (app.core._shared.embed_host). The override is the escape hatch
+    for when the source keeps pointing at a host that no longer answers.
+    """
+    return (read_data().get("video_host") or "").strip()
 
 
 def get_settings() -> dict:

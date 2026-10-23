@@ -4,9 +4,10 @@ import os
 import shutil
 import threading
 import uuid
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.config import VIDEOS_DIR, TMP_DIR, get_settings
@@ -20,6 +21,12 @@ def _get_library_path(type_: str) -> str:
         if lib.get("type") == type_:
             return lib["path"]
     return str(VIDEOS_DIR)
+
+def _schedule_external_id(params: dict) -> Optional[str]:
+    """The source id a scheduled entry's params carry, whatever its type."""
+    value = params.get("id") or params.get("tv_id") or params.get("anime_id")
+    return str(value) if value not in (None, "") else None
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,13 @@ NON_PROGRESS_PHASES = frozenset({"joining", "merging"})
 # The engine is a child process that is SIGTERMed and then SIGKILLed, so this
 # only has to cover the kill escalation plus the ffmpeg teardown.
 ATTEMPT_STOP_TIMEOUT = 60  # seconds
+
+# A failed download is run again this many times, this long after each failure,
+# before it is shown as failed. The source refuses a request now and then and
+# serves the same one a minute later; a configuration mistake just fails fast
+# three more times, which costs nothing.
+AUTO_RETRIES = 3
+AUTO_RETRY_DELAY = 60  # seconds
 
 
 @dataclass
@@ -68,10 +82,6 @@ class DownloadJob:
     # The in-flight attempt. A forced resume waits on this before starting a new
     # one, which is what guarantees a job never has two live attempts.
     future: Optional[Future] = None
-    # The call that runs this job, kept so a forced resume can repeat it.
-    # Storing the call rather than the parameters keeps this independent of the
-    # submit_*() signatures, which upstream changes freely.
-    call: Optional[tuple] = None
 
     # Set when this job is one episode of a season or series asked for in one go,
     # so the notification can be a single summary instead of one per episode.
@@ -89,6 +99,111 @@ class DownloadJob:
     year: Optional[str] = None
     season: Optional[int] = None
     episode_number: Optional[str] = None
+    # The title's id at its source (film id, series id, AnimeUnity id). What
+    # the library registry files the finished download under, so the title can
+    # be found again whatever its folder ends up being called.
+    external_id: Optional[str] = None
+
+    # What was handed to the executor, minus the arguments bound to this job
+    # object (_JOB_BOUND_KWARGS). Kept so a failed job can be run again without
+    # the client re-sending anything — the domain and the requester's identity
+    # must not come from a request body.
+    call: Optional[tuple] = field(default=None, repr=False)
+
+    # Automatic retries used so far, and when the next one starts (None when
+    # none is pending). The job keeps its id and stays non-terminal throughout:
+    # listeners hear about it once, when it is finally done or failed.
+    retries: int = 0
+    retry_at: Optional[datetime] = None
+    # Its ticket while it waits for a download slot (None otherwise): the
+    # waiting jobs start in ticket order, so the frontend can number the line.
+    queue_seq: Optional[int] = None
+
+
+# Rebuilt for every attempt: each belongs to one job id.
+_JOB_BOUND_KWARGS = ("temp_dir", "progress_factory", "cancel_event")
+
+
+def _worth_retrying(exc: Exception) -> bool:
+    """Everything but what no retry can fix.
+
+    A missing audio track waits for a person to choose, and on the request path
+    parks the request. A permission error is a deployment problem (#28): the
+    same uid meets the same mode bits a minute later. Only on POSIX, though —
+    on Windows a sharing violation (a file held open by Jellyfin or an
+    antivirus) is also a PermissionError, carries a ``winerror``, and does go
+    away. Never all of OSError: ``requests.ConnectionError`` is one too.
+    """
+    from app.core._shared import MissingAudioTrackError
+    if isinstance(exc, MissingAudioTrackError):
+        return False
+    if isinstance(exc, PermissionError) and getattr(exc, "winerror", None) is None:
+        return False
+    return True
+
+
+class DownloadSlots:
+    """At most ``limit`` downloads at once, granted strictly in arrival order.
+
+    Replaces a ``threading.BoundedSemaphore``, which promises nothing about
+    which waiter goes next — so the "In attesa" list could not honestly say
+    what starts next (#26). It also fixes what changing the limit did: the
+    semaphore was *replaced*, leaving every job already waiting on the old one
+    under the old limit while new jobs used the new, so going from 3 to 5 could
+    run 8 at once. Here the limit changes in place, for everyone.
+
+    A waiter leaves the line as soon as its job is cancelled instead of
+    holding its place until a slot frees up.
+    """
+
+    def __init__(self, limit: int):
+        self._cond = threading.Condition()
+        self._limit = limit
+        self._busy = 0
+        self._line: deque = deque()
+        self._tickets = 0
+
+    def acquire(self, job: "DownloadJob", on_queued=None) -> bool:
+        """Wait for a slot. False when the job was cancelled while waiting."""
+        # Read once: a forced resume gives the job a fresh event, and a waiter
+        # re-reading the attribute would never see the cancel meant for it.
+        cancel_event = job.cancel_event
+        with self._cond:
+            self._tickets += 1
+            job.queue_seq = self._tickets
+            self._line.append(job)
+        if on_queued is not None:
+            on_queued(job)
+        with self._cond:
+            try:
+                while not (self._line[0] is job and self._busy < self._limit):
+                    if cancel_event.is_set():
+                        return False
+                    self._cond.wait()
+                if cancel_event.is_set():
+                    return False
+                self._busy += 1
+                return True
+            finally:
+                self._line.remove(job)
+                job.queue_seq = None
+                # The next in line may now be at the head with a slot free.
+                self._cond.notify_all()
+
+    def release(self) -> None:
+        with self._cond:
+            self._busy -= 1
+            self._cond.notify_all()
+
+    def resize(self, limit: int) -> None:
+        with self._cond:
+            self._limit = limit
+            self._cond.notify_all()
+
+    def wake(self) -> None:
+        """Let waiters re-check: a cancelled one leaves the line."""
+        with self._cond:
+            self._cond.notify_all()
 
 
 class JobManager:
@@ -96,9 +211,7 @@ class JobManager:
         self._jobs: dict[str, DownloadJob] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=64)
-        n = get_settings().get("max_concurrent_downloads", 3)
-        self._semaphore = threading.BoundedSemaphore(n)
-        self._semaphore_value = n
+        self._slots = DownloadSlots(get_settings().get("max_concurrent_downloads", 3))
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._subscribers: list[asyncio.Queue] = []
         self._schedule_store = None  # set via set_schedule_store()
@@ -111,12 +224,9 @@ class JobManager:
         return steps
 
     def update_max_concurrent(self, n: int):
-        old = self._semaphore_value
-        if n == old:
-            return
-        # Replace semaphore — existing running downloads are unaffected
-        self._semaphore = threading.BoundedSemaphore(n)
-        self._semaphore_value = n
+        # In place: running downloads keep their slot, waiting ones get the new
+        # limit too (see DownloadSlots).
+        self._slots.resize(n)
 
     def set_loop(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
@@ -161,6 +271,10 @@ class JobManager:
             "season": job.season,
             "episode_number": job.episode_number,
             "year": job.year,
+            "retries": job.retries,
+            "queue_seq": job.queue_seq,
+            "max_retries": AUTO_RETRIES,
+            "retry_at": job.retry_at.isoformat() if job.retry_at else None,
         }
 
     # ── Global pub/sub ─────────────────────────────────────────────────────────
@@ -348,7 +462,7 @@ class JobManager:
             if self._schedule_store is not None and job.schedule_id:
                 self._schedule_store.mark_fired(job.schedule_id)
         self._broadcast({"type": "job_status", "job_id": job.job_id, "status": "queued"})
-        job.call = (fn, args, kwargs)
+        self._remember_call(job, fn, args, kwargs)
         self._track(job, self._executor.submit(self._run_download, job, fn, *args, **kwargs))
 
     def _build_call(self, type_: str, params: dict, job: DownloadJob):
@@ -413,6 +527,7 @@ class JobManager:
             job.cancel_event.set()
             job.status = "cancelled"
             job.stalled = False
+        self._slots.wake()
         self._emit(job, {"type": "error", "message": "Annullato"})
         if was_scheduled:
             self._notify_listeners(job)
@@ -441,13 +556,18 @@ class JobManager:
             job.cancel_event.set()
             job.cancel_event = threading.Event()
             fn, args, kwargs = job.call
-            # The stored call carries the cancel_event of the attempt that just
-            # died; the new one needs the fresh event or it would start already
-            # cancelled.
-            if "cancel_event" in kwargs:
-                kwargs = {**kwargs, "cancel_event": job.cancel_event}
-                job.call = (fn, args, kwargs)
+            # The stored call leaves out what is bound to an attempt
+            # (_JOB_BOUND_KWARGS). Same temp_dir as before, which is the point:
+            # the segments already on disk are what this attempt resumes from.
+            kwargs = {
+                **kwargs,
+                "temp_dir": str(TMP_DIR / job.job_id),
+                "progress_factory": self._make_progress_factory(job),
+                "cancel_event": job.cancel_event,
+            }
             job.status = "queued"
+            job.retries = 0
+            job.retry_at = None
             job.stalled = False
             job.error = None
             job.phase = None
@@ -508,58 +628,143 @@ class JobManager:
         self._broadcast({"type": "job_dismissed", "job_id": job_id})
         return True
 
+    def retry(self, job_id: str) -> Optional[str]:
+        """Run a failed job again as a new job; returns the new job id.
+
+        The failed entry goes away in the same step, so a second failure makes a
+        fresh entry instead of a duplicate. The new job leaves the batch it came
+        from: that batch counted this episode already, and closes (or has
+        closed) on its own count — reporting into it again would close it early
+        or land in a batch that no longer exists. A retry succeeding is
+        therefore announced on its own.
+        """
+        with self._lock:
+            old = self._jobs.get(job_id)
+            if not old or old.status != "error" or old.call is None:
+                return None
+            del self._jobs[job_id]
+        if self._schedule_store is not None:
+            self._schedule_store.remove_by_job_id(job_id)
+        self._broadcast({"type": "job_dismissed", "job_id": job_id})
+
+        job = self._make_job(
+            old.title, old.type, phases=list(old.phases),
+            user_id=old.user_id, media_label=old.media_label, year=old.year,
+            season=old.season, episode_number=old.episode_number,
+            external_id=old.external_id,
+        )
+        # The new id gets the old one's segments, so "Riprova" resumes rather
+        # than starting the whole title over.
+        old_tmp, new_tmp = TMP_DIR / job_id, TMP_DIR / job.job_id
+        if old_tmp.exists():
+            try:
+                os.replace(old_tmp, new_tmp)
+            except OSError as exc:
+                logger.warning("Could not carry %s over to the retry: %s", old_tmp, exc)
+        fn, args, kwargs = old.call
+        return self._submit_job(
+            job, fn, *args, **kwargs,
+            temp_dir=str(TMP_DIR / job.job_id),
+            progress_factory=self._make_progress_factory(job),
+            cancel_event=job.cancel_event,
+        )
+
+    @staticmethod
+    def _remember_call(job: DownloadJob, fn, args, kwargs):
+        job.call = (fn, args, {k: v for k, v in kwargs.items() if k not in _JOB_BOUND_KWARGS})
+
     def _run_download(self, job: DownloadJob, fn, *args, **kwargs):
         # Listeners fire outside the semaphore: a listener does DB writes and
         # blocking HTTP (external notification channels), and holding a download
         # slot for that would cost real throughput. The outer try/finally makes
         # every path notify exactly once — including the job cancelled before it
         # ever started, which used to return early and notify nobody, leaving
-        # anything counting completions waiting forever.
+        # anything counting completions waiting forever. An automatic retry is
+        # not a path out: it loops here, so a batch still counts the episode
+        # once, with its final outcome.
         try:
-            with self._semaphore:
-                if job.cancel_event.is_set():
+            while self._attempt(job, fn, args, kwargs):
+                # The wait holds no download slot, and a cancel ends it at once.
+                if job.cancel_event.wait(AUTO_RETRY_DELAY):
+                    job.retry_at = None
                     job.status = "cancelled"
                     job.stalled = False
                     self._emit(job, {"type": "error", "message": "Annullato"})
                     return
-
-                job.status = "running"
-                self._broadcast({"type": "job_status", "job_id": job.job_id, "status": "running"})
-
-                try:
-                    result = fn(*args, **kwargs)
-                    job.status = "done"
-                    job.stalled = False
-                    job.output_path = result
-                    self._emit(job, {"type": "done", "output_path": result})
-                except DownloadCancelledError:
-                    job.status = "cancelled"
-                    job.stalled = False
-                    self._emit(job, {"type": "error", "message": "Annullato"})
-                except Exception as e:
-                    logger.exception(f"Job {job.job_id} failed: {e}")
-                    job.status = "error"
-                    job.stalled = False
-                    job.error = str(e)
-                    self._emit(job, {"type": "error", "message": str(e)})
-                finally:
-                    # Only a completed download clears its scratch space. A
-                    # failed or cancelled one keeps it, which is what lets a
-                    # forced resume pick up the segments already on disk — the
-                    # engine writes them atomically, so what is there is whole.
-                    if job.status == "done":
-                        tmp_path = TMP_DIR / job.job_id
-                        if tmp_path.exists():
-                            shutil.rmtree(tmp_path, ignore_errors=True)
-                            logger.info("Cleaned up temp dir: %s", tmp_path)
+                job.retry_at = None
+                if "progress_factory" in kwargs:
+                    # The factory carries byte totals from phase to phase; the
+                    # failed attempt's must not count toward the new one.
+                    kwargs = {**kwargs, "progress_factory": self._make_progress_factory(job)}
         finally:
             self._notify_listeners(job)
+
+    def _attempt(self, job: DownloadJob, fn, args, kwargs) -> bool:
+        """Run the download once. True when it failed and should run again."""
+        if not self._slots.acquire(job, on_queued=self._announce_queued):
+            job.status = "cancelled"
+            self._emit(job, {"type": "error", "message": "Annullato"})
+            return False
+        try:
+            job.status = "running"
+            # The stall clock starts now, not when the job was queued: time spent
+            # waiting for a slot or for a retry is not the engine going quiet.
+            job.phase = None
+            job.last_progress_at = datetime.now(timezone.utc)
+            self._broadcast({"type": "job_status", "job_id": job.job_id, "status": "running"})
+
+            try:
+                result = fn(*args, **kwargs)
+                job.status = "done"
+                job.stalled = False
+                job.output_path = result
+                self._emit(job, {"type": "done", "output_path": result})
+            except DownloadCancelledError:
+                job.status = "cancelled"
+                job.stalled = False
+                self._emit(job, {"type": "error", "message": "Annullato"})
+            except Exception as e:
+                job.stalled = False
+                if job.retries < AUTO_RETRIES and _worth_retrying(e):
+                    job.retries += 1
+                    logger.warning("Job %s failed (%s); retry %d/%d in %ds",
+                                   job.job_id, e, job.retries, AUTO_RETRIES, AUTO_RETRY_DELAY)
+                    job.status = "queued"
+                    job.error = str(e)
+                    job.retry_at = datetime.now(timezone.utc) + timedelta(seconds=AUTO_RETRY_DELAY)
+                    job.progress = {**job.progress, "current": 0, "pct": 0, "speed": 0,
+                                    "eta": None, "bytes_done": 0}
+                    self._broadcast({"type": "job_retrying", "job": self._job_to_dict(job)})
+                    return True
+                logger.exception(f"Job {job.job_id} failed: {e}")
+                job.status = "error"
+                job.error = str(e)
+                self._emit(job, {"type": "error", "message": str(e)})
+            finally:
+                # Only a completed download clears its scratch space. A failed
+                # or cancelled one keeps it, which is what lets the automatic
+                # retry, "Riprova" and a forced resume pick up the segments
+                # already on disk — the engine writes them atomically, so what
+                # is there is whole.
+                if job.status == "done":
+                    tmp_path = TMP_DIR / job.job_id
+                    if tmp_path.exists():
+                        shutil.rmtree(tmp_path, ignore_errors=True)
+                        logger.info("Cleaned up temp dir: %s", tmp_path)
+        finally:
+            self._slots.release()
+        return False
+
+    def _announce_queued(self, job: DownloadJob) -> None:
+        """A job joined the line for a slot — first time, or back from a retry
+        wait. Its ticket is what orders the "In attesa" list."""
+        self._broadcast({"type": "job_queued", "job_id": job.job_id, "queue_seq": job.queue_seq})
 
     def _submit_job(self, job: DownloadJob, fn, *args, **kwargs) -> str:
         with self._lock:
             self._jobs[job.job_id] = job
+        self._remember_call(job, fn, args, kwargs)
         self._broadcast({"type": "job_created", "job": self._job_to_dict(job)})
-        job.call = (fn, args, kwargs)
         self._track(job, self._executor.submit(self._run_download, job, fn, *args, **kwargs))
         return job.job_id
 
@@ -599,7 +804,8 @@ class JobManager:
 
         job = self._make_job(title, "film", schedule_id=schedule_id,
                              phases=self._compute_phases(audio_languages or ["ita"]),
-                             user_id=user_id, media_label=title, year=year)
+                             user_id=user_id, media_label=title, year=year,
+                             external_id=str(id_film))
         return self._submit_job(
             job, download_film,
             id_film, title, domain,
@@ -631,7 +837,8 @@ class JobManager:
                              phases=self._compute_phases(audio_languages or ["ita"]),
                              user_id=user_id, batch_id=batch_id, batch_kind=batch_kind,
                              batch_label=batch_label, media_label=tv_name, year=year,
-                             season=season, episode_number=str(ep["n"]))
+                             season=season, episode_number=str(ep["n"]),
+                             external_id=str(tv_id))
         return self._submit_job(
             job, download_episode,
             tv_id, eps, ep_index, domain, token, tv_name, season,
@@ -665,7 +872,7 @@ class JobManager:
                              phases=self._compute_phases(audio_languages or ["ita"]),
                              user_id=user_id, batch_id=batch_id, batch_kind=batch_kind,
                              batch_label=batch_label, media_label=anime_name, year=year,
-                             episode_number=str(ep_num))
+                             episode_number=str(ep_num), external_id=str(anime_id))
         return self._submit_job(
             job, download_anime_episode,
             anime_id, episode, anime_name, anime_type,
@@ -751,6 +958,7 @@ class JobManager:
         # survives until the download actually runs. It does not survive a
         # restart (load_scheduled_from_store rebuilds from the JSON params), and
         # neither does the in-memory batch it would belong to.
+        meta.setdefault("external_id", _schedule_external_id(params))
         job = self._make_job(title, type_, scheduled_at=scheduled_at, schedule_id=schedule_id,
                              phases=self._compute_phases(params.get("audio_languages") or ["ita"]),
                              **meta)
@@ -773,8 +981,12 @@ class JobManager:
             sa_raw = datetime.fromisoformat(entry["scheduled_at"])
             scheduled_at = sa_raw if sa_raw.tzinfo else sa_raw.replace(tzinfo=timezone.utc)
             title = params.get("title") or params.get("tv_name") or params.get("anime_name", "?")
+            # What the registry needs to file the download survives in the
+            # params; the rest of the notification metadata does not.
             job = self._make_job(title, type_, scheduled_at=scheduled_at, schedule_id=sid,
-                                 phases=self._compute_phases(params.get("audio_languages") or ["ita"]))
+                                 phases=self._compute_phases(params.get("audio_languages") or ["ita"]),
+                                 media_label=title, year=params.get("year"),
+                                 external_id=_schedule_external_id(params))
             with self._lock:
                 self._jobs[job.job_id] = job
             self._schedule_store.set_job_id(sid, job.job_id)

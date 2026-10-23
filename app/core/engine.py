@@ -216,6 +216,7 @@ def run_download(
     audio_track_urls: Optional[list] = None,
     subtitle_track_urls: Optional[list] = None,
     subtitle_languages: Optional[list] = None,
+    subtitle_mode: str = "embed",
     max_segment_workers: int = 16,
     user_agent: Optional[str] = None,
     ffmpeg_path: Optional[str] = None,
@@ -244,6 +245,7 @@ def run_download(
             if t.get("uri")
         ],
         "subtitle_languages": list(subtitle_languages or []),
+        "subtitle_mode": subtitle_mode,
     }
     if key:
         spec["key_hex"] = key

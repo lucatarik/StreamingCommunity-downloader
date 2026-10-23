@@ -542,16 +542,11 @@ async fn sigterm_stops_promptly_and_leaves_a_resumable_state() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// Audio renditions and subtitles arrive as separate playlists and must end up
-/// inside one Matroska file, with the sidecar `.vtt` cleaned up so Jellyfin
-/// does not list every track twice.
-#[tokio::test]
-async fn merges_audio_and_subtitles_into_a_single_mkv() {
-    let work = workspace("mux");
+/// A CDN serving the video, reused as an audio rendition, plus one Italian
+/// subtitle playlist; and a spec asking for all of it, written to `output`.
+async fn mux_fixture(work: &Path, output: &str) -> (FakeCdn, serde_json::Value) {
     let assets = work.join("cdn");
     make_hls_fixture(&assets);
-
-    // A subtitle playlist pointing at a WebVTT file.
     std::fs::write(
         assets.join("subs.m3u8"),
         "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nsub.vtt\n#EXT-X-ENDLIST\n",
@@ -564,26 +559,44 @@ async fn merges_audio_and_subtitles_into_a_single_mkv() {
     .expect("vtt");
 
     let cdn = FakeCdn::start(assets, Faults::default()).await;
-    let mut spec = spec_for(&cdn, &work, "index.m3u8");
+    let mut spec = spec_for(&cdn, work, "index.m3u8");
+    spec["output_path"] = work.join(output).to_string_lossy().into();
     spec["audio_tracks"] = serde_json::json!([{ "url": cdn.url("index.m3u8"), "language": "ita" }]);
     spec["subtitle_tracks"] = serde_json::json!([{ "uri": cdn.url("subs.m3u8"), "language": "ita" }]);
+    (cdn, spec)
+}
 
+/// Runs a mux spec and returns the output, checking what every mux must
+/// satisfy: the requested path comes back unchanged, and no staging file is
+/// left in the library folder.
+async fn run_mux(spec: serde_json::Value) -> (EngineRun, PathBuf) {
+    let requested = PathBuf::from(spec["output_path"].as_str().unwrap());
     let run = tokio::task::spawn_blocking(move || run_engine(&spec))
         .await
         .expect("join");
-
     assert_eq!(run.code, 0, "mux failed:\n{}", run.stderr);
+
     let output = PathBuf::from(run.event("done").expect("done")["output_path"].as_str().unwrap());
-    assert_eq!(
-        output.extension().and_then(|e| e.to_str()),
-        Some("mkv"),
-        "extra tracks mean a remux, and the panel needs the real path back"
-    );
+    assert_eq!(output, requested, "the container is the panel's choice, never changed");
     assert!(output.exists());
-    assert!(
-        !output.with_extension("mp4").exists(),
-        "the intermediate mp4 must not be left beside the mkv"
-    );
+    let leftovers: Vec<_> = std::fs::read_dir(output.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+    (run, output)
+}
+
+/// Audio renditions and subtitles arrive as separate playlists and must end up
+/// inside one Matroska file, with the sidecar `.vtt` cleaned up so Jellyfin
+/// does not list every track twice.
+#[tokio::test]
+async fn merges_audio_and_subtitles_into_a_single_mkv() {
+    let work = workspace("mux");
+    let (_cdn, spec) = mux_fixture(&work, "out/Film (2020)/Film (2020).mkv").await;
+    let (run, output) = run_mux(spec).await;
 
     let probed = probe(&output);
     assert!(probed.contains("codec_type=subtitle"), "no subtitles: {probed}");
@@ -592,6 +605,7 @@ async fn merges_audio_and_subtitles_into_a_single_mkv() {
         1,
         "expected exactly one audio track: {probed}"
     );
+    assert!(!output.with_file_name("Film (2020).it.vtt").exists());
 
     // The phases the panel's progress UI keys off must all be announced.
     let phases = run.phases();
@@ -601,6 +615,43 @@ async fn merges_audio_and_subtitles_into_a_single_mkv() {
             "phase {expected} never emitted, got {phases:?}"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// MP4 has no WebVTT track type: embedding there means timed text.
+#[tokio::test]
+async fn embeds_subtitles_into_an_mp4_as_timed_text() {
+    let work = workspace("mux-mp4");
+    let (_cdn, spec) = mux_fixture(&work, "out/Film (2020)/Film (2020).mp4").await;
+    let (_run, output) = run_mux(spec).await;
+
+    let probed = probe(&output);
+    assert!(probed.contains("codec_type=subtitle"), "no subtitles: {probed}");
+    assert_eq!(probed.matches("codec_type=audio").count(), 1, "{probed}");
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// `external` leaves the subtitles out of the container, beside the video
+/// under Jellyfin's `<stem>.<lang>.vtt` name — moved there out of the temp
+/// dir, which a completed download clears.
+#[tokio::test]
+async fn external_subtitles_land_beside_the_video() {
+    let work = workspace("mux-external");
+    let (_cdn, mut spec) = mux_fixture(&work, "out/Film (2020)/Film (2020).mkv").await;
+    spec["subtitle_mode"] = "external".into();
+    let (_run, output) = run_mux(spec).await;
+
+    let probed = probe(&output);
+    assert!(!probed.contains("codec_type=subtitle"), "embedded anyway: {probed}");
+    assert_eq!(probed.matches("codec_type=audio").count(), 1, "{probed}");
+    let sidecar = output.with_file_name("Film (2020).it.vtt");
+    assert!(
+        std::fs::read_to_string(&sidecar).is_ok_and(|t| t.contains("ciao")),
+        "no sidecar at {}",
+        sidecar.display()
+    );
 
     let _ = std::fs::remove_dir_all(&work);
 }

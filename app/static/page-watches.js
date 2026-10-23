@@ -48,12 +48,10 @@ function renderWatchesStats() {
   ).join('');
 }
 
-// The owner's DOWNLOAD permission is what the poller checks, so a follower
-// without it must not be told the episode will just appear. An ownerless watch
-// (no accounts at all) always downloads: there is no queue to wait in.
+// Computed by the server with the poller's rule: the owner's live DOWNLOAD
+// permission is not something the browser can see for someone else's series.
 function _watchIsAutomatic(w) {
-  return w.created_by === null || w.auto_approve ||
-    (!!_me && w.created_by === _me.user.id && can('DOWNLOAD'));
+  return !!w.automatic;
 }
 
 function renderWatchesList() {
@@ -77,11 +75,19 @@ function renderWatchesList() {
       ? '<span class="badge bg-green-lt">download automatico</span>'
       : '<span class="badge bg-yellow-lt">passa dalla coda</span>';
     const kind = w.media_type === 'anime' ? 'Anime' : 'Serie TV';
-    const audio = w.audio_languages.length ? w.audio_languages.join(', ') : 'originale';
+    const audio = w.audio_languages.length ? w.audio_languages.map(langName).join(', ') : 'originale';
+    const subs = w.subtitle_languages.length ? w.subtitle_languages.map(langName).join(', ') : 'nessuno';
+    const langButton = _canEditWatchLanguages(w)
+      ? `<button class="btn btn-sm btn-outline-secondary" data-action="watch:languages" data-id="${w.id}"
+                 title="Tracce audio e sottotitoli dei prossimi episodi">
+           <i class="ti ti-language me-1"></i>Lingue
+         </button>`
+      : '';
     // Arming is the approver's decision, and only worth offering where it would
-    // change something: a series that already downloads by itself has nothing
-    // to approve.
-    const canArm = can('MANAGE_REQUESTS') && w.created_by !== null;
+    // change something: a series that already downloads by itself — its owner
+    // holds DOWNLOAD — has nothing to approve. An armed one keeps its button,
+    // or the flag could never be taken off again.
+    const canArm = can('MANAGE_REQUESTS') && w.created_by !== null && (w.auto_approve || !auto);
     const armButton = !canArm ? '' : w.auto_approve
       ? `<button class="btn btn-sm btn-outline-secondary" data-action="watch:arm" data-id="${w.id}" data-on="0"
                  title="I nuovi episodi torneranno a passare dalla coda di approvazione">
@@ -91,6 +97,26 @@ function renderWatchesList() {
                  title="Approva la serie una volta: i nuovi episodi verranno scaricati senza passare dalla coda">
            <i class="ti ti-bell-check me-1"></i>Approva automatico
          </button>`;
+    // Followers who asked for tracks the series does not download. Shown to
+    // whoever can act on it, with the button that does.
+    const gap = w.missing_languages || {audio: [], subtitles: [], by: []};
+    const gapParts = [
+      gap.audio.length ? `audio ${gap.audio.map(langName).join(', ')}` : '',
+      gap.subtitles.length ? `sottotitoli ${gap.subtitles.map(langName).join(', ')}` : '',
+    ].filter(Boolean).join(' e ');
+    const gapHtml = gapParts && _canEditWatchLanguages(w)
+      ? `<div class="req-problem mt-1">
+           <i class="ti ti-language"></i> ${gap.by.length ? escapeHtml(gap.by.join(', ')) : 'Altri follower'}
+           ${gap.by.length === 1 ? 'chiede' : 'chiedono'}
+           anche ${escapeHtml(gapParts)}
+         </div>`
+      : '';
+    const mergeButton = gapHtml
+      ? `<button class="btn btn-sm btn-outline-warning" data-action="watch:merge" data-id="${w.id}"
+                 title="Scarica tutte le lingue richieste dai follower, dai prossimi episodi">
+           <i class="ti ti-arrows-join me-1"></i>Unisci lingue
+         </button>`
+      : '';
     const who = can('MANAGE_REQUESTS') && w.followers && w.followers.length
       ? `<span class="req-dot">·</span><i class="ti ti-user"></i> ${escapeHtml(w.followers.join(', '))}`
       : '';
@@ -103,14 +129,19 @@ function renderWatchesList() {
             <span class="req-dot">·</span>
             <i class="ti ti-volume"></i> ${escapeHtml(audio)}
             <span class="req-dot">·</span>
+            <i class="ti ti-badge-cc"></i> ${escapeHtml(subs)}
+            <span class="req-dot">·</span>
             <i class="ti ti-refresh"></i> ${escapeHtml(fmtLastChecked(w.last_checked_at))}
             ${who}
           </div>
+          ${gapHtml}
         </div>
         <div class="req-side">
           ${badge}
           <div class="req-actions">
             ${armButton}
+            ${mergeButton}
+            ${langButton}
             <button class="btn btn-sm btn-outline-secondary" id="watch-check-${w.id}"
                     data-action="watch:check" data-id="${w.id}"
                     title="Cerca subito nuovi episodi, senza aspettare il controllo automatico">
@@ -123,6 +154,80 @@ function renderWatchesList() {
         </div>
       </div>`;
   }).join('');
+}
+
+// Mirrors the server: one watch serves every follower, so its languages are the
+// owner's call or an approver's. Without accounts the watch is the panel's.
+function _canEditWatchLanguages(w) {
+  return w.created_by === null || can('MANAGE_REQUESTS')
+    || (!!_me && _me.user.id === w.created_by);
+}
+
+let _langWatchId = null;
+
+// Offers the tracks the series really has, read from its latest episode on
+// open. A language the watch keeps but the source no longer carries stays on
+// the list, flagged: dropping it silently would hide why its episodes fail.
+async function openWatchLanguages(watchId) {
+  const w = _watches.find(x => x.id === watchId);
+  if (!w) return;
+  _langWatchId = watchId;
+  document.getElementById('watch-lang-title').textContent = w.title;
+  const audioBox = document.getElementById('watch-lang-audio');
+  const subsBox = document.getElementById('watch-lang-subs');
+  const saveBtn = document.getElementById('watch-lang-save');
+  const loading = '<span class="text-muted"><span class="spinner-border spinner-border-sm me-1"></span>Lettura delle tracce dalla fonte...</span>';
+  audioBox.innerHTML = loading;
+  subsBox.innerHTML = '';
+  saveBtn.disabled = true;
+  showModal('watch-lang-modal');
+
+  let tracks;
+  try {
+    tracks = await api.get(`/api/watches/${watchId}/tracks`);
+  } catch (e) {
+    if (_langWatchId !== watchId) return;
+    audioBox.innerHTML = `<div class="alert alert-danger mb-0">${escapeHtml(errText(e, 'Tracce non leggibili dalla fonte'))}</div>`;
+    return;
+  }
+  if (_langWatchId !== watchId) return;
+
+  const boxes = (available, current, cls) => {
+    const codes = [...new Set([...available, ...current])];
+    if (!codes.length) return '<span class="text-muted">Nessuna traccia disponibile.</span>';
+    return codes.map(c => {
+      const gone = !available.includes(c);
+      return `<label class="me-2 mb-1" style="cursor:pointer"
+                     ${gone ? 'title="Non presente nell\'ultimo episodio pubblicato"' : ''}>
+        <input type="checkbox" class="${cls} me-1" value="${escapeHtml(c)}" ${current.includes(c) ? 'checked' : ''}>
+        <span class="badge ${gone ? 'bg-red-lt' : 'bg-blue-lt'}">${escapeHtml(langName(c))}${gone ? ' · non disponibile' : ''}</span></label>`;
+    }).join('');
+  };
+  audioBox.innerHTML = boxes(tracks.audio, w.audio_languages, 'watch-lang-audio-check');
+  subsBox.innerHTML = boxes(tracks.subtitles, w.subtitle_languages, 'watch-lang-subs-check');
+  saveBtn.disabled = false;
+}
+
+async function saveWatchLanguages() {
+  const picked = cls => [...document.querySelectorAll(`.${cls}:checked`)].map(c => c.value);
+  const audio = picked('watch-lang-audio-check');
+  if (!audio.length) { showToast('Scegli almeno una traccia audio', 'warning'); return; }
+  try {
+    await api.put(`/api/watches/${_langWatchId}/languages`, {
+      audio_languages: audio, subtitle_languages: picked('watch-lang-subs-check'),
+    });
+  } catch (e) { showToast(errText(e), 'danger'); return; }
+  hideModal('watch-lang-modal');
+  showToast('Lingue aggiornate: varranno dai prossimi episodi', 'success');
+  loadWatches();
+}
+
+async function mergeWatchLanguages(watchId) {
+  try {
+    await api.post(`/api/watches/${watchId}/merge-languages`);
+  } catch (e) { showToast(errText(e), 'danger'); return; }
+  showToast('Lingue unite: varranno dai prossimi episodi', 'success');
+  loadWatches();
 }
 
 // The follow toggle lives in two modals whose contexts are shaped differently,
@@ -144,7 +249,7 @@ function _followTarget(kind) {
       audio_languages: _tpPicked('audio'),
       subtitle_languages: _tpPicked('subs'),
       // A film has no next episode to wait for.
-      followable: _tp.type !== 'movie' && (!anime || (_tp.animeType || 'tv') !== 'movie'),
+      followable: _tp.type !== 'movie' && (!anime || !isAnimeFilm(_tp.animeType)),
     };
   }
   if (kind === 'anime') {
@@ -159,7 +264,7 @@ function _followTarget(kind) {
       audio_languages: _animeCtx.audioLangs || [],
       subtitle_languages: _animeCtx.subLangs || [],
       // A one-shot anime film has no next episode to wait for.
-      followable: (_animeCtx.animeType || 'tv') !== 'movie',
+      followable: !isAnimeFilm(_animeCtx.animeType),
     };
   }
   return {
@@ -239,10 +344,18 @@ async function toggleFollowSeries(kind) {
       // Only true for someone who can start downloads. Without that permission
       // each new episode becomes a request an approver has to accept, and
       // saying otherwise sets up a wait for something that never arrives.
-      showToast(can('DOWNLOAD')
+      // The languages are named because they are the ones the watch keeps —
+      // taken from the pickers as they stood, or, when the series was already
+      // followed, the ones it had.
+      const langs = (data.audio_languages || []).map(langName).join(', ') || 'originale';
+      const differs = !!data.languages_differ;
+      showToast((can('DOWNLOAD')
         ? 'Serie seguita: i nuovi episodi arriveranno da soli'
-        : 'Serie seguita: i nuovi episodi verranno richiesti a un amministratore',
-        'success');
+        : 'Serie seguita: i nuovi episodi verranno richiesti a un amministratore')
+        + (differs
+          ? ` — la serie era già seguita con audio ${langs}: le lingue in più che hai scelto sono state segnalate a un amministratore`
+          : ` (audio: ${langs}; modificabile da «Serie seguite»)`),
+        differs ? 'warning' : 'success');
     }
     if (document.getElementById('page-watches').style.display !== 'none') loadWatches();
   } catch (e) {
@@ -317,4 +430,7 @@ registerActions({
   'watch:arm':      d => setWatchAutoApprove(Number(d.id), d.on === '1'),
   'watch:check':    d => checkWatchNow(Number(d.id)),
   'watch:unfollow': d => unfollowWatch(Number(d.id)),
+  'watch:languages': d => openWatchLanguages(Number(d.id)),
+  'watch:merge':     d => mergeWatchLanguages(Number(d.id)),
+  'watch:saveLanguages': () => saveWatchLanguages(),
 });

@@ -225,3 +225,29 @@ def test_checking_a_watch_by_hand_is_allowed_without_accounts(client, open_panel
     assert response.status_code == 200, response.text
     assert response.json()["new"] == 1
     assert [name for name, _, _ in stub_jobs] == ["submit_episode"]
+
+
+def test_changed_languages_reach_the_next_episode(client, open_panel, stub_jobs):
+    watch = client.post("/api/watches", json=TV_BODY).json()
+
+    response = client.put(f"/api/watches/{watch['id']}/languages", json={
+        "audio_languages": ["ita", "eng"], "subtitle_languages": ["eng", "ita"],
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["audio_languages"] == ["eng", "ita"]
+    open_panel.episodes.append({"id": 904, "n": "4", "name": "Episodio 4"})
+    poller.run_poll_cycle()
+    _, _, kwargs = stub_jobs[0]
+    assert kwargs["audio_languages"] == ["eng", "ita"]
+    assert kwargs["subtitle_languages"] == ["eng", "ita"]
+
+
+def test_a_language_code_that_is_not_one_is_refused(client, open_panel):
+    watch = client.post("/api/watches", json=TV_BODY).json()
+
+    response = client.put(f"/api/watches/{watch['id']}/languages", json={
+        "audio_languages": ["Italiano"], "subtitle_languages": [],
+    })
+
+    assert response.status_code == 422

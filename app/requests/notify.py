@@ -38,6 +38,9 @@ DOWNLOAD_BATCH_FAILED = "download_batch_failed"
 # look at and the approver with nothing to decide.
 WATCH_NEEDS_APPROVAL = "watch_needs_approval"
 WATCH_AUTO_APPROVED = "watch_auto_approved"
+# Someone joined a followed series asking for tracks it does not download. One
+# watch means one file per episode, so it is a decision, not a per-user setting.
+WATCH_LANGUAGES_DIFFER = "watch_languages_differ"
 
 # The source domain rotating. FOUND asks for a decision — a candidate is only
 # ever proposed, never adopted, unless auto-apply is on — so it is the one
@@ -68,6 +71,7 @@ ALL_EVENTS = (
     DOWNLOAD_BATCH_FAILED,
     WATCH_NEEDS_APPROVAL,
     WATCH_AUTO_APPROVED,
+    WATCH_LANGUAGES_DIFFER,
     SOURCE_DOMAIN_FOUND,
     SOURCE_DOMAIN_APPLIED,
     HOOK_FAILED,
@@ -96,6 +100,7 @@ EVENT_NOTIFY_TYPE = {
     DOWNLOAD_BATCH_FAILED: FAILURE,
     WATCH_NEEDS_APPROVAL: WARNING,
     WATCH_AUTO_APPROVED: SUCCESS,
+    WATCH_LANGUAGES_DIFFER: WARNING,
     SOURCE_DOMAIN_FOUND: WARNING,
     SOURCE_DOMAIN_APPLIED: SUCCESS,
     HOOK_FAILED: WARNING,

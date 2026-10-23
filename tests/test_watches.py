@@ -88,7 +88,38 @@ def test_a_second_follower_joins_the_same_watch(client, panel):
     second = _follow(client, _login(client, ann)).json()
 
     assert second["id"] == first["id"]
-    assert sorted(second["followers"]) == ["ann", "bob"]
+    assert sorted(watch_models.follower_names(first["id"])) == ["ann", "bob"]
+    # Who else follows it is not ann's to see.
+    assert second["followers"] == []
+
+
+def test_the_owner_can_change_the_languages(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    csrf = _login(client, bob)
+    watch_id = _follow(client, csrf).json()["id"]
+
+    response = client.put(f"/api/watches/{watch_id}/languages",
+                          json={"audio_languages": ["ita", "eng"], "subtitle_languages": ["ita"]},
+                          headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 200, response.text
+    assert watch_models.get(watch_id).audio_languages == ["eng", "ita"]
+
+
+def test_a_second_follower_cannot_change_the_languages(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    watch_id = _follow(client, _login(client, bob)).json()["id"]
+    ann = _user("ann", Permission.REQUEST)
+    csrf = _login(client, ann)
+    _follow(client, csrf)
+
+    response = client.put(f"/api/watches/{watch_id}/languages",
+                          json={"audio_languages": ["eng"], "subtitle_languages": []},
+                          headers={"X-CSRF-Token": csrf})
+
+    # One watch serves both: ann changing it would change it for bob.
+    assert response.status_code == 403
+    assert watch_models.get(watch_id).audio_languages == ["ita"]
 
 
 def test_unfollowing_the_last_follower_stops_the_watch(client, panel):
@@ -144,6 +175,44 @@ def test_a_new_episode_becomes_a_pending_request(client, panel):
     assert created[0].status == request_models.PENDING
     assert created[0].episode_number == "4"
     assert created[0].watch_id is not None
+
+
+def test_a_stale_year_is_corrected_before_a_new_episode_lands(client, panel):
+    """A follow from before #21 stored the latest season's year; every new
+    episode would otherwise keep landing in that folder (#24)."""
+    bob = _user("bob", Permission.REQUEST)
+    watch_id = _follow(client, _login(client, bob)).json()["id"]
+    panel.props = {"type": "tv", "release_date": "2004-03-01", "last_air_date": "2019-05-01"}
+    panel.episodes.append({"id": 904, "n": "4", "name": "Episodio 4"})
+
+    poller.run_poll_cycle()
+
+    assert watch_models.get(watch_id).year == "2004"
+    assert request_models.list_all()[0].year == "2004"
+
+
+def test_a_year_that_cannot_be_read_is_kept(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    watch_id = _follow(client, _login(client, bob)).json()["id"]
+    panel.episodes.append({"id": 904, "n": "4", "name": "Episodio 4"})
+
+    poller.run_poll_cycle()
+
+    assert watch_models.get(watch_id).year == "2019"
+    assert request_models.list_all()[0].year == "2019"
+
+
+def test_a_quiet_cycle_does_not_look_the_year_up(client, panel, monkeypatch):
+    from app.core import metadata
+
+    bob = _user("bob", Permission.REQUEST)
+    _follow(client, _login(client, bob))
+    looked = []
+    monkeypatch.setattr(metadata, "title_metadata", lambda *a, **k: looked.append(a) or {})
+
+    poller.run_poll_cycle()
+
+    assert looked == []
 
 
 def test_an_owner_with_download_permission_skips_the_queue(client, panel, stub_jobs):
@@ -216,6 +285,43 @@ def test_an_unchanged_series_creates_nothing(client, panel):
 
     assert poller.run_poll_cycle() == {"watches": 1, "new": 0}
     assert request_models.list_all() == []
+
+
+@pytest.mark.parametrize("anime_type", ["Movie", "film"])
+def test_an_anime_film_cannot_be_followed(client, panel, anime_type):
+    bob = _user("bob", Permission.REQUEST)
+    csrf = _login(client, bob)
+
+    response = _follow(client, csrf, {**ANIME_BODY, "anime_type": anime_type})
+
+    assert response.status_code == 400
+    assert watch_models.list_all() == []
+
+
+def test_an_anime_film_watch_from_before_the_guard_is_not_polled(client, panel, monkeypatch):
+    """Following a film is refused now; one followed earlier must stay inert."""
+    watch, _ = watch_models.create(
+        source="animeunity", media_type="anime", external_id="56", title="Test Film",
+        anime_type="Movie", audio_languages=["ita"], subtitle_languages=[], created_by=None,
+    )
+
+    def never(watch):
+        raise AssertionError("an anime film was enumerated")
+
+    monkeypatch.setattr(poller, "current_episodes", never)
+
+    assert poller.poll_watch(watch) == {"checked": 0, "new": 0, "outcomes": {}}
+    assert request_models.list_all() == []
+
+
+def test_an_overlong_anime_type_is_refused(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    csrf = _login(client, bob)
+
+    response = _follow(client, csrf, {**ANIME_BODY, "anime_type": "x" * 33})
+
+    assert response.status_code == 422
+    assert watch_models.list_all() == []
 
 
 def test_anime_are_followed_the_same_way(client, panel, stub_jobs):
@@ -520,3 +626,177 @@ def test_the_last_follower_leaving_stops_the_series(client, panel):
 
     assert response.json()["stopped"] is True
     assert watch_models.get(watch_id).enabled is False
+
+
+# ── Followers asking for different languages ──────────────────────────────────
+
+def test_joining_with_extra_languages_tells_the_approvers(client, panel):
+    boss = _user("boss", ALL_PERMISSIONS)
+    bob = _user("bob", Permission.REQUEST)
+    _follow(client, _login(client, bob))
+    ann = _user("ann", Permission.REQUEST)
+
+    body = _follow(client, _login(client, ann), {
+        **TV_BODY, "audio_languages": ["ita", "eng"], "subtitle_languages": ["eng"],
+    }).json()
+
+    assert any("ann segue «Test Series» chiedendo anche audio ENG e sottotitoli ENG" in m
+               for m in _bell(boss)), _bell(boss)
+    # ann is told it is about her; the names stay with the approvers.
+    assert body["languages_differ"] is True
+    assert body["missing_languages"] == {"audio": ["eng"], "subtitles": ["eng"], "by": []}
+    # Nothing is changed on ann's behalf: that is the approver's call.
+    assert watch_models.get(body["id"]).audio_languages == ["ita"]
+
+
+def test_joining_with_fewer_languages_is_not_a_conflict(client, panel):
+    boss = _user("boss", ALL_PERMISSIONS)
+    bob = _user("bob", Permission.REQUEST)
+    _follow(client, _login(client, bob), {**TV_BODY, "audio_languages": ["ita", "eng"]})
+    before = len(_bell(boss))
+    ann = _user("ann", Permission.REQUEST)
+
+    body = _follow(client, _login(client, ann)).json()
+
+    assert body["missing_languages"]["by"] == []
+    assert not any("chiedendo anche" in m for m in _bell(boss)[before:])
+
+
+def test_merging_downloads_every_language_asked_for(client, panel):
+    boss = _user("boss", ALL_PERMISSIONS)
+    bob = _user("bob", Permission.REQUEST)
+    watch_id = _follow(client, _login(client, bob)).json()["id"]
+    ann = _user("ann", Permission.REQUEST)
+    _follow(client, _login(client, ann), {**TV_BODY, "subtitle_languages": ["ita"]})
+    tom = _user("tom", Permission.REQUEST)
+    _follow(client, _login(client, tom), {**TV_BODY, "audio_languages": ["eng"]})
+
+    csrf = _login(client, boss)
+    response = client.post(f"/api/watches/{watch_id}/merge-languages",
+                           headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 200, response.text
+    watch = watch_models.get(watch_id)
+    assert watch.audio_languages == ["eng", "ita"]
+    assert watch.subtitle_languages == ["ita"]
+    assert response.json()["missing_languages"]["by"] == []
+
+
+def test_a_follower_cannot_merge(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    watch_id = _follow(client, _login(client, bob)).json()["id"]
+    ann = _user("ann", Permission.REQUEST)
+    csrf = _login(client, ann)
+    _follow(client, csrf, {**TV_BODY, "audio_languages": ["eng"]})
+
+    response = client.post(f"/api/watches/{watch_id}/merge-languages",
+                           headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 403
+
+
+def test_the_owner_sees_the_gap_but_not_who_asked(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    _follow(client, _login(client, bob))
+    ann = _user("ann", Permission.REQUEST)
+    _follow(client, _login(client, ann), {**TV_BODY, "audio_languages": ["eng"]})
+
+    _login(client, bob)
+    listed = client.get("/api/watches/mine").json()["watches"][0]
+
+    assert listed["missing_languages"] == {"audio": ["eng"], "subtitles": [], "by": []}
+    assert listed["followers"] == []
+
+
+def test_an_approver_sees_who_follows_and_who_asked(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    _follow(client, _login(client, bob))
+    ann = _user("ann", Permission.REQUEST)
+    _follow(client, _login(client, ann), {**TV_BODY, "audio_languages": ["eng"]})
+
+    _login(client, _user("boss", ALL_PERMISSIONS))
+    listed = client.get("/api/watches").json()["watches"][0]
+
+    assert sorted(listed["followers"]) == ["ann", "bob"]
+    assert listed["missing_languages"]["by"] == ["ann"]
+
+
+def test_download_alone_does_not_list_everyones_watches(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    _follow(client, _login(client, bob))
+
+    _login(client, _user("dan", Permission.DOWNLOAD))
+
+    assert client.get("/api/watches").status_code == 403
+    assert client.get("/api/watches/mine").json()["watches"] == []
+
+
+def test_the_tracks_offered_are_the_latest_episode_s(client, panel, monkeypatch):
+    from app.core import tv
+
+    asked = []
+
+    def languages(tv_id, ep_id, *a, **k):
+        asked.append(ep_id)
+        return {"audio": ["ita", "ita", "jpn"], "subtitles": ["forced-ita", "eng"]}
+
+    monkeypatch.setattr(tv, "get_episode_languages", languages)
+    bob = _user("bob", Permission.REQUEST)
+    csrf = _login(client, bob)
+    watch_id = _follow(client, csrf).json()["id"]
+
+    response = client.get(f"/api/watches/{watch_id}/tracks")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"audio": ["ita", "jpn"], "subtitles": ["forced-ita", "eng"]}
+    assert asked == [903]   # episode 3, the latest published
+    # A forced-subtitle code the source offers can be chosen.
+    saved = client.put(f"/api/watches/{watch_id}/languages",
+                       json={"audio_languages": ["jpn"], "subtitle_languages": ["forced-ita"]},
+                       headers={"X-CSRF-Token": csrf})
+    assert saved.status_code == 200, saved.text
+
+
+def test_a_follower_cannot_read_the_tracks_dialog(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    watch_id = _follow(client, _login(client, bob)).json()["id"]
+    ann = _user("ann", Permission.REQUEST)
+    _follow(client, _login(client, ann))
+
+    assert client.get(f"/api/watches/{watch_id}/tracks").status_code == 403
+
+
+def test_an_unreadable_source_is_reported_not_guessed(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    watch_id = _follow(client, _login(client, bob)).json()["id"]
+    panel.dead = True
+
+    assert client.get(f"/api/watches/{watch_id}/tracks").status_code == 502
+
+
+# ── Whether a series downloads by itself ──────────────────────────────────────
+
+def test_a_series_is_automatic_when_its_owner_can_download(client, panel):
+    ann = _user("ann", Permission.REQUEST | Permission.DOWNLOAD)
+    _follow(client, _login(client, ann))
+    bob = _user("bob", Permission.REQUEST)
+    _follow(client, _login(client, bob), {**TV_BODY, "external_id": "78"})
+
+    # Seen by an approver, who holds neither series: the browser could not
+    # have worked this out from its own permissions.
+    _login(client, _user("boss", Permission.MANAGE_REQUESTS))
+    listed = {w["external_id"]: w for w in client.get("/api/watches").json()["watches"]}
+
+    assert listed["77"]["automatic"] is True
+    assert listed["78"]["automatic"] is False
+
+
+def test_arming_makes_a_series_automatic(client, panel):
+    bob = _user("bob", Permission.REQUEST)
+    watch_id = _follow(client, _login(client, bob)).json()["id"]
+    csrf = _login(client, _user("boss", ALL_PERMISSIONS))
+
+    armed = client.post(f"/api/watches/{watch_id}/auto-approve", json={"enabled": True},
+                        headers={"X-CSRF-Token": csrf}).json()
+
+    assert armed["automatic"] is True

@@ -124,6 +124,12 @@ async function logout() {
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 
+// Whether an AnimeUnity kind (its own media_type: Movie, TV, ONA, …) is a film.
+// Mirrors paths._ANIME_FILM_KINDS: everything else is a series.
+function isAnimeFilm(kind) {
+  return ['movie', 'film'].includes(String(kind || 'tv').trim().toLowerCase());
+}
+
 function scConfirm(msg) {
   return new Promise(resolve => {
     document.getElementById('sc-confirm-msg').textContent = msg;
@@ -347,7 +353,9 @@ const LANG_NAMES = {
   deu:'Deutsch', por:'Português', jpn:'日本語', zho:'中文',
   ara:'العربية', rus:'Русский', kor:'한국어',
 };
-const langName = c => LANG_NAMES[c] || c;
+const langName = c => c.startsWith('forced-')
+  ? `${langName(c.slice(7))} (forzati)`
+  : LANG_NAMES[c] || c;
 
 
 // formatSize() stops at GB and is used for file rows; volumes are routinely in

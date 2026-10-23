@@ -129,6 +129,7 @@
 - Independent permissions: download directly, request, approve, manage users, manage settings
 - Request queue with approval, preserving the audio and subtitle tracks the requester chose
 - Request status on the search result cards, and an in-app notification bell
+- MCP server for AI agents (Claude Code, Cursor, …): search, download, follow series and work the request queue
 - Docker ready
 
 ---
@@ -151,6 +152,27 @@ The image is published to GitHub Container Registry on every push to `main`:
 ```
 ghcr.io/edoardofiore/streamingcommunity-downloader:latest
 ```
+
+### Running as your own user
+
+By default the container runs as root, so the files it downloads belong to root. To have them
+belong to you instead, uncomment `user:` in the compose file with your uid and gid (`id -u`,
+`id -g`):
+
+```yaml
+    user: "1000:1000"
+```
+
+That user has to be able to write the library and the config folder on the host. If the panel ran
+as root before, hand them over once:
+
+```bash
+sudo chown -R 1000:1000 /srv/scpanel/config   # and the library, if root wrote files there
+```
+
+If it still cannot write its config or its temp folder, the panel does not start, and the log names
+the uid and every path it is missing. A library it cannot write is only a warning — it may be a
+network mount that comes up later — but downloads into it will fail.
 
 ### Trying a branch before it is released
 
@@ -326,7 +348,7 @@ failed and why.
 | `DB_FILE` | `panel.db` | users, sessions, requests — **put this on a persistent volume** |
 | `DATA_FILE` | `data.json` | source domain, libraries, performance settings |
 | `SCHEDULE_FILE` | `schedule.json` | scheduled downloads |
-| `TMP_DIR` | `tmp` | HLS segments while a job runs, cleaned up afterwards |
+| `TMP_DIR` | `tmp` | HLS segments while a job runs, cleaned up afterwards; writable by any uid in the image |
 | `FFMPEG_PATH` | — | full path to `ffmpeg`, when it is not on `PATH` |
 | `FFPROBE_PATH` | — | full path to `ffprobe`; see the note below |
 | `DOMAIN_SOURCE_URL` | a public page | where replacement domains are read from |
@@ -464,6 +486,44 @@ manager.
 
 ---
 
+## Model Context Protocol (MCP)
+
+The panel can act as an MCP server, so an AI agent (Claude Code, Cursor, or any
+client speaking Streamable HTTP) can search titles, start and watch downloads,
+follow series and file or approve requests. It is served by the panel itself at
+`/mcp` — no extra port, and the same reverse proxy and TLS as the web interface.
+
+Off by default. Enable it under **Impostazioni → MCP**, then generate a token.
+The token is shown once (only its hash is stored), and **the agent acts as the
+user who generated it, with that user's current permissions**: an agent cannot
+download if its owner cannot, and the token stops working if the owner is
+disabled or removed. Requests it files are that user's requests.
+
+Client configuration (the settings page shows it pre-filled):
+
+```json
+{
+  "mcpServers": {
+    "streamingcommunity": {
+      "type": "http",
+      "url": "https://panel.example.com/mcp",
+      "headers": { "Authorization": "Bearer <TOKEN>" }
+    }
+  }
+}
+```
+
+With Claude Code: `claude mcp add --transport http streamingcommunity https://panel.example.com/mcp --header "Authorization: Bearer <TOKEN>"`.
+
+Tools: `search_content`, `get_content_details`, `get_series_episodes`,
+`get_anime_episodes`, `get_home_shelves`, `download_film`, `download_episode`,
+`download_season`, `download_anime_episode`, `list_downloads`,
+`get_download_progress`, `cancel_download`, `retry_download`, `follow_series`,
+`list_followed_series`, `unfollow_series`, `check_series_now`, `submit_request`,
+`list_requests`, `approve_request`, `get_system_status`, `list_libraries`.
+
+---
+
 ## Output structure
 
 ```
@@ -477,9 +537,18 @@ videos/
         └── Series S01E02.mkv
 ```
 
-The extension is `.mp4` for a single audio track and `.mkv` once there is more than one, which is
-what carrying several languages in one file requires. Subtitles are embedded and also written beside
-the video as `{name}.{lang}.vtt`, the layout Jellyfin expects.
+The container is yours to pick, in **Settings -> Download -> Output format**: `.mkv` (the default,
+which holds any combination of tracks) or `.mp4`, for devices that cannot play Matroska — plenty of
+older smart TVs, Chromecast and consoles. Nothing is re-encoded either way, so the choice costs no
+download time: the source is already H.264 with AAC audio, which both containers take as they are.
+
+Subtitles follow a second setting: muxed into the file, or written beside it as
+`{name}.{lang}.vtt`, the layout Jellyfin expects. Inside an MP4 they have to be converted to
+`mov_text`, which drops colours, bold and positioning — keeping them as separate files avoids that
+entirely.
+
+Changing either setting leaves what is already downloaded alone. Both extensions keep counting as
+present, so nothing is re-downloaded because of it.
 
 ---
 

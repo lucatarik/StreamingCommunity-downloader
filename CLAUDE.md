@@ -61,7 +61,7 @@ child process can be killed, so cancellation is enforceable — which is what
 allows `jobs.py` to assume one live attempt per job.
 
 ```bash
-cargo test --manifest-path engine/Cargo.toml       # 35 unit + 7 end-to-end
+cargo test --manifest-path engine/Cargo.toml       # 45 unit + 9 end-to-end
 cargo build --release --manifest-path engine/Cargo.toml
 ```
 
@@ -74,6 +74,9 @@ The end-to-end tests run the real binary against a fake CDN that injects 503s,
   `fetch_page_props()` read the Inertia payload out of the server-rendered page's
   `data-page` attribute — no XHR headers, no session — and `normalize_title()` is the
   one place a raw title becomes a result. `home.py` uses all three.
+  Pages of the source go through `get_localized()` / `site_url()`, never a literal
+  `/it`: some hosts serve no locale segment (#34), and the form each host answers
+  to is learned from a 404 and remembered per host.
 - `home.py` — the shelves each source publishes on its own front page, behind a TTL
   cache keyed on `(source, host)`, so a rotation cannot reach the old domain's entry
 - `domain_recovery.py` — finds the source domain again when it rotates: scrapes a
@@ -83,6 +86,7 @@ The end-to-end tests run the real binary against a fake CDN that injects 503s,
 - `naming.py` — the file/folder naming templates and their validation
 - `film.py` — movie resolve + download; also owns `_collect_audio_tracks` / `_collect_subtitle_tracks`, which `tv.py` and `animeunity.py` import
 - `tv.py` — seasons, episodes, per-episode languages, episode download
+- `hosts.py` — validation and verification of the AnimeUnity host and the video host override
 - `animeunity.py` — AnimeUnity search (`/archivio/get-animes`, paged 30 at a time,
   with the source's own `type` and `dubbed` filters), episodes, download
 - `engine.py` — spawns `sc-dl-engine`, forwards its events into the progress bars, and turns `cancel_event` into SIGTERM (escalating to SIGKILL)
@@ -113,22 +117,30 @@ The end-to-end tests run the real binary against a fake CDN that injects 503s,
 - `poller.py` — periodic enumeration, diff against what is seen, auto-download decision
 - `router.py` — follow, unfollow, status, manual check
 
-**`app/`** — `jobs.py` (thread pool, semaphore, SSE broadcast), `downloads_notify.py` (notifications
+**`app/mcp/`** — MCP server for AI agents, at `/mcp` on the panel itself
+- `server.py` — the `/mcp` ASGI endpoint (switch, bearer token, Streamable HTTP transport) and
+  the session manager the lifespan runs
+- `auth.py` — the single token: stored hashed, owned by whoever generated it
+- `tools.py` — the tools, each a thin call into an existing route handler
+
+**`app/`** — `jobs.py` (thread pool, `DownloadSlots`, SSE broadcast), `downloads_notify.py` (notifications
 for downloads that skipped the queue, one summary per season/series), `downloads_hooks.py`
-(post-download webhooks and the Jellyfin library refresh), `schedule.py`, `db.py`,
-`config.py`, `progress.py`, `routers/`, `templates/`, `static/`
+(post-download webhooks and the Jellyfin library refresh), `library.py` (the registry of which
+folder holds which title; endpoints in `routers/library.py`, UI in `static/library.js`), `schedule.py`, `db.py`,
+`config.py`, `progress.py`, `writable.py` (the boot check that temp, config and libraries can be
+written), `routers/`, `templates/`, `static/`
 
 ### Persistence
 
 - `panel.db` (SQLite, stdlib `sqlite3`) — users, sessions, requests, notifications, notification
-  channels, download hooks, followed series, and the `auth_mode` answer. Migrations are the ordered
+  channels, download hooks, followed series, the library folder registry, and the `auth_mode` answer. Migrations are the ordered
   `MIGRATIONS` list in `app/db.py`, applied against `PRAGMA user_version`. Never edit an applied
   migration; append a new one. An entry is a list of SQL statements, or a `(conn, fresh)` callable
   when the decision depends on whether the database already existed — `fresh` is the only way to
   tell an upgrade from a first run, since a brand-new file reaches the last migration in the same
   pass as the first.
-- `data.json` — source domain, library paths, performance settings, domain-recovery switches,
-  naming templates. Anything carrying a secret goes in `panel.db` instead. Written only through
+- `data.json` — source domain, AnimeUnity/video host overrides, library paths, performance settings, domain-recovery switches,
+  naming templates, output container. Anything carrying a secret goes in `panel.db` instead. Written only through
   `config.update_data()`, which holds the file lock: a background thread writes `domain`. Runtime state, not committed:
   a baked-in source domain ships stale, since the domain rotates. Tests get one from the
   `_configured_domain` autouse fixture in `tests/conftest.py`.
@@ -136,6 +148,14 @@ for downloads that skipped the queue, one summary per season/series), `downloads
 
 Point `DB_FILE`, `DATA_FILE` and `SCHEDULE_FILE` at a persistent volume in Docker; see
 `docker-compose.template.yml`.
+
+**The image runs as root by default and must also run under any `user:` (#28).** Everything the
+panel writes inside the image itself (`/app/tmp`, `/app/config`) is created `1777` in the
+Dockerfile; anything new it writes in-image needs the same, or a non-root container fails only once
+a download starts. `writable.check()` runs first in the lifespan, before migrations: temp and config
+not writable is fatal and names the uid and every path, a library is only a warning (it may be a
+mount that comes up later). A `PermissionError` is not auto-retried on POSIX; on Windows it can be
+a sharing violation, which is.
 
 `docs/` holds README screenshots only. It is **not** served by the app and is excluded from the
 image — the favicon lives in `app/static/`. Design notes go in `design/`, likewise never served:
@@ -174,7 +194,10 @@ anything under a mounted static directory is readable by unauthenticated visitor
   whole anime flow keys off that, from the detail modal to the episodes endpoint to
   the job kind. The source's own word (Movie/TV/OVA/ONA/Special, and a long tail like
   "TV Short") rides beside it in `media_type`. Folding one into the other is what made
-  every anime, films included, render as a TV series.
+  every anime, films included, render as a TV series. The reverse holds for the
+  layout: `paths.is_anime_series()` names the film (`_ANIME_FILM_KINDS`: `movie`,
+  `film`) and treats every other value as a series — listing the series kinds instead sent an ONA down the
+  single-file path, every episode overwriting one episode-less file.
 - **A page payload is unescaped exactly once.** BeautifulSoup decodes HTML entities in
   attribute values itself — the `data-page` on StreamingCommunity, `items-json` and
   `animes` on AnimeUnity — so there is no `html.unescape()` on top, and adding one
@@ -221,6 +244,21 @@ anything under a mounted static directory is readable by unauthenticated visitor
   never fires. That is why `jobs.py` notifies listeners on *every* path out of `_run_download`,
   including the job cancelled before it started, and why `cancel()` notifies for a job still
   `scheduled` that the executor never saw.
+- **Download slots are granted in arrival order, and the limit changes in place.**
+  `jobs.DownloadSlots` replaced a `BoundedSemaphore`, which promised no wake-up order — so the
+  downloads page could not say what starts next — and which `update_max_concurrent()` *replaced*,
+  leaving jobs already waiting under the old limit beside new ones under the new (3 → 5 could run
+  8). A waiting job carries a `queue_seq` ticket, broadcast as `job_queued`; the page numbers the
+  "In attesa" list by it, so a new way into a slot that skips the line breaks a promise on screen.
+- **An automatic retry is not a way out of a job.** `_run_download` loops on `_attempt()` up to
+  `AUTO_RETRIES` times, `AUTO_RETRY_DELAY` apart, outside the semaphore; the job keeps its id and
+  stays `queued` meanwhile, so listeners still fire once, with the final outcome. A manual retry
+  (`JobManager.retry()`) is the opposite: a *new* job, out of its batch, because the batch already
+  counted the old one. Tests run with `AUTO_RETRIES = 0` (autouse fixture in `tests/conftest.py`).
+- **A watch has one set of languages; followers each keep what they asked for.** The per-follower
+  columns on `jf_series_watch_subscriber` exist only to report the gap
+  (`models.missing_languages()`) and to merge it on an approver's decision — never to change the
+  watch on a follower's behalf, since every added track grows every future episode for everyone.
 - **External channels have no in-app recipient to wait for.** `AppriseChannel` fires with an empty
   user list on purpose: a direct download in open mode has no account, but the webhook is still the
   point. `InAppChannel` keeps the guard — with no recipients there is nothing to insert.
@@ -286,6 +324,67 @@ anything under a mounted static directory is readable by unauthenticated visitor
   so everything it would paper over is refused by `naming.validate()` at save time. Never
   `str.format` a user template: `{title.__class__}` leaks attributes and a stray `{` raises
   mid-download.
+- **The library check asks the name first and the registry second; neither ever moves a file.**
+  By name: the canonical path, plus — for series and anime series — the same title's folders
+  under other years. Before #21 the folder year was the latest season's, so libraries hold
+  `I Simpson/`, `I Simpson (2025)/`, `I Simpson (2026)/` for one show (#24).
+  `resolver.series_years()` finds them by rendering the folder template with each year the library
+  root mentions — no parsing of names back — and refuses any year *earlier* than the canonical
+  one: a wrong year was always a later season's, an earlier one is a remake's original. By
+  registry: `app/library.py` keeps `library_folder` rows keyed on `(source, media_type,
+  external_id)`, the folder stored as a name under the library root so a remounted volume does not
+  orphan it. `origin` says who decided, and **the panel never overrides a person**: `download` and
+  `matched` are filed automatically (matched only when a download lands, never on an episode list
+  being opened, never for a film or anime film); `manual` and `rejected` come from Settings ›
+  Associazioni or the title page. Correcting an id or a folder *rejects* the old pair instead of
+  deleting it — otherwise the next download matches the same folder by name and files it again —
+  and `series_years(exclude=)` skips rejected folders for the same reason. Only a `manual` row
+  decides where new files go (`library.destination()`, called by `resolver.destination_path()` and
+  by all three downloaders), with `season_offset`/`episode_offset` placing a title inside a shared
+  folder: that is how an anime split into parts at the source becomes one series. Check and
+  download build that path with the same `paths.placed_*` functions; keep it that way. Without a
+  `manual` row an episode joins the series' folder already on disk, not the canonical one
+  (`resolver.series_home()`, through `series_episode_path()` for the request path and both episode
+  downloaders): the one holding the most of that season, then the most episodes, canonical on a
+  tie, and never an empty folder. Writing to the canonical year instead gave Ted Lasso a new
+  `(2020)/` beside the `(2026)/` holding the whole series — two series in Jellyfin. The counting is
+  what stops one stray episode from capturing the series, the reason only `manual` used to decide;
+  the registry's `download`/`matched` rows still do not. An
+  associated folder is otherwise searched by the `SxxEyy` in file names, because the title is the
+  part that may have changed. `library.reconcile()` (every poll cycle, and a button) follows a
+  folder renamed outside the panel by the byte size of a file known to be in it — no inode, which
+  Windows lacks — accepting exactly one candidate, and forgets a folder missing for 30 days only
+  while the library root was readable and not empty. A followed series' stored year is corrected
+  from the title props by `poller.refresh_year()`, only in a cycle that found something new.
+- **The container is one setting read in one place, and nothing is ever re-encoded.**
+  `container.configured()` is the only source; `paths.*_path()` take `container=` the way they take
+  `templates=`, and everything downstream infers the container from the extension of the file it is
+  handed rather than from a second lookup — which is what makes the temp audio tracks (genuinely
+  `.mp4`) mux correctly while the destination is Matroska. Three consequences worth knowing.
+  `movflags` is mov/mp4-private: handed to the matroska muxer FFmpeg refuses the whole command, at
+  the end of the download, after every byte is fetched. The remux now reads and writes the *same*
+  extension, so it stages a dot-prefixed sibling in the library folder and `os.replace()`s it —
+  dot-prefixed because a Jellyfin scan running meanwhile would otherwise index the half-written
+  file as a second copy, and a sibling rather than something under `tmp/` because `os.replace`
+  cannot cross a filesystem. And `resolver.candidate_paths()` probes one extension per known
+  container, configured first: two axes, one stat each, which is what
+  `tests/test_naming_library_check.py` pins at exactly two. A finished download deletes the same
+  stem in the *other* container, because Jellyfin reads `Film.mkv` and `Film.mp4` in one folder as
+  two versions of one film — the exact sibling only, and only once the new file is complete. Video and audio are always stream-copied
+  — the source is H.264 + AAC, native to both — so the only conversion is WebVTT to `mov_text`, and
+  only when subtitles are embedded into MP4. A transcoding option does not belong here: it would
+  turn a four-minute download into an hours-long CPU job under a stall watchdog built for neither.
+- **An MCP tool that changes anything calls the route handler, never the layer beneath it.** The agent acts as the
+  token's owner, with their live permissions (`auth.token_owner()`), passed to the handler as
+  `request.state.user` exactly as `AuthMiddleware` would set it; the tool checks the permission
+  the route's dependency declares, since dependencies do not run on a direct call. The first
+  version reimplemented follow, season batches and requests beside the routers and lost, in
+  turn: the seed-or-roll-back (an unreadable source left a watch armed with no baseline, so the
+  next cycle queued the back catalogue), `downloads_notify.abandon()` (a season that failed
+  mid-submit never closed its batch), and the requester (it filed requests as the first Jellyfin
+  admin). The token itself fails closed — no stored hash means no access — travels only in the
+  `Authorization` header (a query string lands in proxy logs), and is not a second server:
+  `/mcp` is a route of the panel, in `PUBLIC_PATHS` only because it authenticates itself.
 - Blocking work goes through `asyncio.to_thread` (routers) or the job pool. Notification channels
   are the exception by design: every caller of `notify()` is already off the loop.
 
@@ -293,19 +392,35 @@ anything under a mounted static directory is readable by unauthenticated visitor
 
 ```
 <library>/
-├── Movie (2020)/Movie (2020).mp4
-└── Series (2019)/Season 01/Series S01E01.mp4
+├── Movie (2020)/Movie (2020).mkv
+└── Series (2019)/Season 01/Series S01E01.mkv
 ```
 
-Subtitles land beside the video as `{stem}.{lang}.vtt` (Jellyfin convention). Temp segments go to
-`tmp/<job_id>/` and are cleaned up afterwards.
+The extension is the `output_container` setting (`mkv` or `mp4`), not a property of the download.
+Subtitles are muxed in, or land beside the video as `{stem}.{lang}.vtt` (Jellyfin convention),
+according to `subtitle_mode`. Temp segments go to `tmp/<job_id>/` and are cleaned up afterwards.
 
 ### Quality and languages
 
 Highest available resolution is chosen automatically (1080p → 720p → 480p → 360p). Audio and
 subtitle languages are chosen per download or per request.
 
-### vixcloud.co quirk
+### vixcloud quirks
+
+The video host is never hardcoded. It moved from `vixcloud.co` to `vixcloud.cc` and every download
+broke, so `_shared.embed_host()` reads it off the embed URL the source itself hands over (SC iframe,
+AnimeUnity `/embed-url/`), `_parse_content()` stores it as `json_win_video["host"]`, and playlist,
+`enc.key` and referers are built from that. The playlist key allowlist (`_KEY_HOSTS`) matches the
+second-level label only, any TLD.
+
+Both moving hosts have a manual escape hatch in Settings › Sorgente › "Altri host"
+(`GET/PUT /api/domain/hosts`, stored in `data.json` as `animeunity_domain` and `video_host`).
+AnimeUnity resolves saved → `ANIMEUNITY_HOST` env → `config.ANIMEUNITY_DEFAULT_HOST`, read per call
+through `animeunity.host()`. `video_host` is empty normally; when set, `_shared.apply_video_host()`
+moves the embed URL onto it *before* anything is fetched, so embed page, playlist, key and referers
+all follow. Every value goes through `hosts.normalize_host()` (bare hostname, no IP/port/path) and is
+verified against the service it claims to be — AnimeUnity's page, a 16-byte `/storage/enc.key` —
+before it is stored.
 
 TV episode M3U8 URLs sometimes return 403; appending `?b=1` (or `&b=1`) resolves it. Handled in
 `_fetch_text_with_b1_fallback` and `_collect_audio_tracks`.

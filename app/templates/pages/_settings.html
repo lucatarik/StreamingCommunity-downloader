@@ -28,6 +28,9 @@
           <a class="nav-link" href="#" data-settings-tab="librerie">Librerie</a>
         </li>
         <li class="nav-item">
+          <a class="nav-link" href="#" data-settings-tab="associazioni">Associazioni</a>
+        </li>
+        <li class="nav-item">
           <a class="nav-link" href="#" data-settings-tab="nomi">Nomi</a>
         </li>
         <li class="nav-item">
@@ -41,6 +44,9 @@
         </li>
         <li class="nav-item">
           <a class="nav-link" href="#" data-settings-tab="hook">Hook</a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link" href="#" data-settings-tab="mcp">MCP</a>
         </li>
       </ul>
 
@@ -58,6 +64,27 @@
             Verifica e salva
           </button>
           <div id="domain-feedback" class="form-text"></div>
+        </div>
+      </div>
+
+      <!-- ── Altri host ────────────────────────────────────────────────── -->
+      <div class="settings-section">
+        <p class="settings-section-label">Altri host</p>
+        <p class="settings-section-hint">
+          Anche AnimeUnity e il server video cambiano dominio. Il server video viene
+          letto dalla sorgente a ogni download; impostalo qui solo se la sorgente
+          continua a indicarne uno che non risponde. Un campo vuoto torna al
+          comportamento automatico. Salvando ogni host viene verificato.
+        </p>
+        <label class="form-label" for="animeunity-host-input">AnimeUnity</label>
+        <input type="text" id="animeunity-host-input" class="form-control" placeholder="www.animeunity.to">
+        <label class="form-label mt-3" for="video-host-input">Server video</label>
+        <input type="text" id="video-host-input" class="form-control" placeholder="Automatico (dalla sorgente)">
+        <div class="settings-actions">
+          <button type="button" class="btn btn-primary btn-sm" data-action="cfg:saveHosts" id="save-hosts-btn">
+            Verifica e salva
+          </button>
+          <div id="hosts-feedback" class="form-text"></div>
         </div>
       </div>
 
@@ -137,6 +164,47 @@
       </div>
       </div>
 
+      <div class="settings-pane" data-settings-pane="associazioni" style="display:none">
+      <!-- ── Associazioni titolo ↔ cartella ─────────────────────────────── -->
+      <div class="settings-section">
+        <p class="settings-section-label">Titoli e cartelle</p>
+        <p class="settings-section-hint">
+          Quale cartella della libreria contiene quale titolo. Il pannello le registra da solo a
+          fine download, e riconosce le cartelle più vecchie della stessa serie salvate con un
+          anno diverso. Qui si correggono: cambiare ID o cartella sostituisce l&rsquo;associazione,
+          e quella vecchia non viene più proposta. Nessun file viene spostato o rinominato.
+        </p>
+        <div class="lib-toolbar mb-2">
+          <select id="lib-filter" class="form-select form-select-sm" data-change="lib:filter"
+                  aria-label="Filtro">
+            <option value="all">Tutte</option>
+            <option value="matched">Riconosciute per anno</option>
+            <option value="manual">Impostate a mano</option>
+            <option value="missing">Cartella mancante</option>
+          </select>
+          <input type="search" id="lib-search" class="form-control form-control-sm"
+                 placeholder="Cerca titolo o cartella" data-input="lib:filter">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-action="lib:reconcile"
+                  id="lib-reconcile-btn" title="Cerca le cartelle rinominate o rimosse">
+            <i class="ti ti-refresh me-1"></i>Verifica cartelle
+          </button>
+        </div>
+        <div id="lib-list"></div>
+        <div class="settings-actions">
+          <div id="lib-feedback" class="form-text"></div>
+        </div>
+
+        <details class="lib-rejected mt-3" id="lib-rejected-wrap" hidden>
+          <summary>Associazioni escluse (<span id="lib-rejected-count">0</span>)</summary>
+          <p class="settings-section-hint mt-2">
+            Coppie corrette o rimosse. Il pannello non le ripropone; ripristinarne una la rende di
+            nuovo riconoscibile in automatico.
+          </p>
+          <div id="lib-rejected-list"></div>
+        </details>
+      </div>
+      </div>
+
       <div class="settings-pane" data-settings-pane="nomi" style="display:none">
       <!-- ── Schema dei nomi ───────────────────────────────────────────── -->
       <div class="settings-section">
@@ -153,8 +221,9 @@
           I valori suggeriti nei campi sono quelli predefiniti e seguono la struttura
           raccomandata dalla <a href="https://jellyfin.org/docs/general/server/media/movies/"
           target="_blank" rel="noopener noreferrer">documentazione ufficiale di Jellyfin</a>:
-          <code>Film (2020)/Film (2020).mkv</code> e
-          <code>Serie (2019)/Season 01/Serie S01E01.mkv</code>. Cambiali solo se la tua libreria
+          <code>Film (2020)/Film (2020)</code> e
+          <code>Serie (2019)/Season 01/Serie S01E01</code>, con l&rsquo;estensione decisa dal
+          formato di uscita. Cambiali solo se la tua libreria
           segue una convenzione diversa: Jellyfin riconosce quella sopra senza configurazione.
         </p>
         <p class="settings-section-hint settings-warn">
@@ -266,6 +335,56 @@
             Salva performance
           </button>
           <div id="perf-settings-feedback" class="form-text"></div>
+        </div>
+      </div>
+
+      <!-- ── Formato di uscita ─────────────────────────── -->
+      <div class="settings-section">
+        <p class="settings-section-label">Formato di uscita</p>
+        <p class="settings-section-hint">
+          In quale contenitore finiscono i file scaricati, e dove finiscono i sottotitoli.
+          Il video non viene mai ricodificato: la sorgente &egrave; gi&agrave; H.264 con audio AAC,
+          che entrambi i contenitori reggono cos&igrave; come sono, quindi cambiare questa
+          impostazione non allunga di un secondo i download.
+        </p>
+        <div class="row g-3">
+          <div class="col-sm-6">
+            <label class="form-label" for="setting-output-container">Contenitore</label>
+            <select id="setting-output-container" class="form-select">
+              <option value="mkv">MKV</option>
+              <option value="mp4">MP4</option>
+            </select>
+            <div class="form-text">
+              MKV regge qualsiasi traccia ed &egrave; il predefinito. Scegli MP4 se guardi su
+              dispositivi che non aprono gli MKV: parecchie smart TV non recenti, Chromecast
+              e console.
+            </div>
+          </div>
+          <div class="col-sm-6">
+            <label class="form-label" for="setting-subtitle-mode">Sottotitoli</label>
+            <select id="setting-subtitle-mode" class="form-select">
+              <option value="embed">Integrati nel file</option>
+              <option value="external">File .vtt separati</option>
+            </select>
+            <div class="form-text">
+              Integrati in un MP4 significa convertiti in <code>mov_text</code>, che perde
+              colori, grassetti e posizionamento. I file separati evitano la conversione:
+              Jellyfin li riconosce lo stesso, perch&eacute; prendono il nome del video.
+            </div>
+          </div>
+        </div>
+        <p class="settings-section-hint settings-warn">
+          <i class="ti ti-alert-triangle me-1"></i>
+          I file gi&agrave; scaricati non vengono convertiti: restano nel contenitore con cui
+          sono stati creati, e continuano a contare come presenti, quindi non verranno
+          riscaricati da soli. Se invece riscarichi un titolo di proposito, la copia nel
+          vecchio contenitore viene sostituita, non affiancata.
+        </p>
+        <div class="settings-actions">
+          <button type="button" class="btn btn-primary btn-sm" data-action="cfg:saveOutput" id="save-output-btn">
+            Salva formato
+          </button>
+          <div id="output-feedback" class="form-text"></div>
         </div>
       </div>
       </div>
@@ -459,6 +578,71 @@
         </button>
         <div class="settings-actions">
           <div id="hooks-feedback" class="form-text"></div>
+        </div>
+      </div>
+      </div>
+
+      <div class="settings-pane" data-settings-pane="mcp" style="display:none">
+      <!-- ── Model Context Protocol ────────────────────────────────────── -->
+      <div class="settings-section">
+        <p class="settings-section-label">Server MCP</p>
+        <p class="settings-section-hint">
+          Permette a un agente AI (Claude Code, Cursor, &hellip;) di cercare titoli, avviare
+          download, seguire serie e gestire le richieste. Il server risponde all&rsquo;indirizzo
+          del pannello, sotto <code>/mcp</code>: nessuna porta in pi&ugrave; da aprire.
+        </p>
+        <p class="settings-section-hint settings-warn">
+          <i class="ti ti-alert-triangle me-1"></i>
+          L&rsquo;agente agisce come l&rsquo;utente che ha generato il token, con i suoi permessi:
+          chi ha il token pu&ograve; fare tutto ci&ograve; che quell&rsquo;utente pu&ograve; fare.
+        </p>
+        <label class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" id="setting-mcp-enabled">
+          <span class="form-check-label">Abilita il server MCP</span>
+        </label>
+        <div class="settings-actions">
+          <button type="button" class="btn btn-primary btn-sm" data-action="cfg:saveMcp" id="save-mcp-btn">
+            Salva
+          </button>
+          <div id="mcp-feedback" class="form-text"></div>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <p class="settings-section-label">Token</p>
+        <p class="settings-section-hint" id="mcp-token-status"></p>
+        <div id="mcp-token-once" class="mb-2" style="display:none">
+          <div class="input-group">
+            <input type="text" id="mcp-token-display" class="form-control font-monospace" readonly>
+            <button class="btn btn-outline-secondary" type="button" data-action="cfg:copyMcpToken" title="Copia token">
+              <i class="ti ti-copy"></i>
+            </button>
+          </div>
+          <div class="form-text settings-warn">
+            Copialo adesso: il pannello ne conserva solo l&rsquo;impronta e non potr&agrave; mostrarlo di nuovo.
+          </div>
+        </div>
+        <div class="settings-actions">
+          <button type="button" class="btn btn-outline-secondary btn-sm" data-action="cfg:regenerateMcpToken" id="mcp-regen-btn">
+            Genera nuovo token
+          </button>
+          <button type="button" class="btn btn-outline-danger btn-sm" data-action="cfg:revokeMcpToken" id="mcp-revoke-btn" style="display:none">
+            Revoca
+          </button>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <p class="settings-section-label">Configurazione del client</p>
+        <p class="settings-section-hint">
+          Trasporto Streamable HTTP, con il token nell&rsquo;header <code>Authorization</code>.
+          Dietro un reverse proxy usa l&rsquo;indirizzo pubblico del pannello, in HTTPS.
+        </p>
+        <pre class="settings-snippet"><code id="mcp-config-snippet"></code></pre>
+        <div class="settings-actions">
+          <button class="btn btn-outline-secondary btn-sm" type="button" data-action="cfg:copyMcpSnippet">
+            <i class="ti ti-copy me-1"></i>Copia
+          </button>
         </div>
       </div>
       </div>

@@ -96,6 +96,32 @@
       margin-bottom: 14px;
     }
     .search-filters:empty { margin-bottom: 0; }
+    .search-filters .results-view { margin-left: auto; display: flex; gap: 6px; }
+
+    /* ── Results as a list (#35) ──
+       The same cards as the grid, laid out as rows, so a title is read in
+       full. Each column takes the whole row; the poster shrinks to a thumb. */
+    #search-results.results-list { --bs-gutter-y: .5rem; }
+    #search-results.results-list > [class*="col-"] { flex: 0 0 100%; width: 100%; max-width: 100%; }
+    .results-list .result-card { flex-direction: row; align-items: center; position: relative; }
+    .results-list .result-card:hover {
+      transform: none !important;
+      box-shadow: none !important;
+    }
+    .results-list .poster-wrap { width: 52px; position: static; }
+    .results-list .result-card:hover .poster-wrap img { transform: none; }
+    .results-list .poster-noimg { font-size: 1.4rem; }
+    .results-list .poster-overlay,
+    .results-list .poster-play { display: none; }
+    /* Out of the thumb, which is too small to hold it, to the row's end. */
+    .results-list .status-ribbon { top: 50%; right: 12px; transform: translateY(-50%); }
+    .results-list .card-meta { padding: 8px 14px; min-width: 0; padding-right: 130px; }
+    .results-list .card-meta .card-title-text { white-space: normal; font-size: 14px; }
+    .results-list .skeleton-card { aspect-ratio: auto; height: 78px; }
+    @media (max-width: 575px) {
+      .results-list .card-meta { padding-right: 108px; }
+      .results-list .card-meta .card-title-text { font-size: 13px; }
+    }
 
     #search-more .source-btn { display: inline-flex; }
 
@@ -350,6 +376,8 @@
     .jg-summary { margin-left: auto; display: flex; gap: 9px; flex-shrink: 0; }
     .jg-n { font-size: 11px; font-variant-numeric: tabular-nums; }
     .jg-live { color: var(--blue); }
+    .jg-wait { color: var(--text-sub); }
+    .jg-sched { color: var(--yellow); }
     .jg-ok   { color: var(--green); }
     .jg-err  { color: var(--danger); }
     /* The cards inside lose their own frame: the group is the frame now. */
@@ -587,6 +615,56 @@
       margin-top: 14px;
     }
     .settings-actions .form-text { margin: 0; }
+    /* A block to copy into another program's config: the same chip as inline
+       <code>, scrolling sideways rather than wrapping a JSON line. */
+    .settings-snippet {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: rgba(255,255,255,.06);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xs);
+      padding: 10px 12px;
+      margin: 0;
+      overflow-x: auto;
+    }
+
+    /* ── Library associations (Settings › Associazioni) ────── */
+    .lib-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .lib-toolbar .form-select { width: auto; flex: 0 0 auto; }
+    .lib-toolbar input[type="search"] { flex: 1 1 180px; min-width: 0; }
+    .lib-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 0; border-bottom: 1px solid var(--border);
+    }
+    .lib-row-main { flex: 1; min-width: 0; }
+    .lib-row-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+    .lib-row-name { color: var(--text); font-size: 13px; }
+    .lib-id, .th-fact-id {
+      font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .lib-type { font-size: 11px; color: var(--text-dim); }
+    .lib-row-folder {
+      display: flex; align-items: center; gap: 6px; min-width: 0;
+      margin-top: 2px; font-size: 12px; color: var(--text-sub);
+    }
+    .lib-row-folder .ti { color: var(--text-muted); flex: 0 0 auto; }
+    .lib-offsets { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+    .lib-origin { flex: 0 0 auto; }
+    .lib-row-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+    .lib-row-rejected .lib-row-name { color: var(--text-sub); }
+    .lib-rejected summary { cursor: pointer; font-size: 12px; color: var(--text-muted); }
+
+    /* The title page's own view of it */
+    .lib-card-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 0; border-bottom: 1px solid var(--border);
+      font-size: 12px; color: var(--text-sub);
+    }
+    .lib-card-row > .ti { color: var(--text-muted); flex: 0 0 auto; }
+    .lib-card-main { flex: 1; min-width: 0; }
+    .lib-card-meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 3px; }
+    #lib-assoc-source { font-family: var(--font-mono); font-size: 12px; }
 
     /* Empty state */
     #jobs-empty { color: var(--text-dim) !important; }
@@ -1226,6 +1304,13 @@
     /* Batch actions sit at the end of the season bar, away from the per-row
        buttons: "the whole season" and "this episode" should not be adjacent. */
     .th-season-batch { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+    .th-only-missing {
+      display: inline-flex; align-items: center; gap: 6px;
+      margin: 0 6px 0 0; min-height: 0;
+      font-size: 13px; color: var(--text-sub); cursor: pointer;
+    }
+    .th-only-missing .form-check-input { margin: 0; float: none; }
+    .th-only-missing-n { color: var(--text-muted); }
 
     /* Scheduling. Empty means now, which is why it is a field and not a mode. */
     .th-sched {
