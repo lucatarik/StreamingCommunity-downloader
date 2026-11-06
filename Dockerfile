@@ -50,4 +50,7 @@ RUN sc-dl-engine --help >/dev/null 2>&1 || test -x /usr/local/bin/sc-dl-engine
 
 EXPOSE 8000
 
+# How this panel gets updated, which the new-version dialog has to explain.
+ENV SCPANEL_INSTALL=docker
+
 CMD ["sh", "-c", "umask 000 && exec python main.py"]

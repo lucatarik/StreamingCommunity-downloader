@@ -91,6 +91,9 @@ SETTINGS_DEFAULTS = {
     # its own. See app.core.domain_recovery.
     "domain_auto_apply": False,
     "domain_check_interval_minutes": 360,
+    # Whether to ask GitHub periodically for a newer release. A switch because
+    # it is the one call a self-hosted panel makes that its job does not need.
+    "update_check_enabled": True,
     # Ask Jellyfin to scan when a download lands, instead of waiting for its
     # own schedule. Inert unless Jellyfin is connected.
     "jellyfin_refresh_on_download": False,
@@ -124,9 +127,9 @@ def configured_domain() -> str:
 
 
 # Where AnimeUnity lives unless an administrator says otherwise. The source moves
-# TLD (.so to .to); Settings › Sorgente overrides it without a release, and the
+# TLD (.so to .to to .co); Settings › Sorgente overrides it without a release, and the
 # ANIMEUNITY_HOST env var still works for deployments that set it.
-ANIMEUNITY_DEFAULT_HOST = "www.animeunity.to"
+ANIMEUNITY_DEFAULT_HOST = "www.animeunity.co"
 
 
 def configured_animeunity_host() -> str:

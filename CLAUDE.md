@@ -128,7 +128,10 @@ for downloads that skipped the queue, one summary per season/series), `downloads
 (post-download webhooks and the Jellyfin library refresh), `library.py` (the registry of which
 folder holds which title; endpoints in `routers/library.py`, UI in `static/library.js`), `schedule.py`, `db.py`,
 `config.py`, `progress.py`, `writable.py` (the boot check that temp, config and libraries can be
-written), `routers/`, `templates/`, `static/`
+written), `updates.py` (the new-version check against GitHub releases, and the only renderer of
+their notes: everything is escaped there, so `notes_html` is the one server-made HTML the frontend
+inserts as is; badge in `static/panel.js`), `updater_client.py` (the panel's side of `updater/`, the
+optional service that replaces the panel's container), `routers/`, `templates/`, `static/`
 
 ### Persistence
 
@@ -198,6 +201,13 @@ anything under a mounted static directory is readable by unauthenticated visitor
   layout: `paths.is_anime_series()` names the film (`_ANIME_FILM_KINDS`: `movie`,
   `film`) and treats every other value as a series — listing the series kinds instead sent an ONA down the
   single-file path, every episode overwriting one episode-less file.
+- **Seasons are the numbers the title page lists, never `1..seasons_count`.** Numbering has
+  holes — Bake Off Italia is 1-4 and 10-14, `seasons_count` 9 (#40) — and the site answers a
+  season it lacks with **season 1**, status 200. Counting showed five copies of S01 and filed them
+  as S05-S09. `tv.get_season_numbers()` is the enumeration everywhere, and `get_info_season()`
+  refuses a page whose `loadedSeason.number` is not the one asked. Watch ledgers seeded before
+  the fix hold those phantom seasons; `poller._rebaseline_phantom_seasons()` drops them and
+  re-seeds instead of queueing the real seasons as new.
 - **A page payload is unescaped exactly once.** BeautifulSoup decodes HTML entities in
   attribute values itself — the `data-page` on StreamingCommunity, `items-json` and
   `animes` on AnimeUnity — so there is no `html.unescape()` on top, and adding one
@@ -250,6 +260,22 @@ anything under a mounted static directory is readable by unauthenticated visitor
   leaving jobs already waiting under the old limit beside new ones under the new (3 → 5 could run
   8). A waiting job carries a `queue_seq` ticket, broadcast as `job_queued`; the page numbers the
   "In attesa" list by it, so a new way into a slot that skips the line breaks a promise on screen.
+- **Pausing is per batch and never touches a running download (#43).** A job mid-download holds a
+  vixcloud token issued when it started; a job still waiting asks for its own when it starts, so
+  only those are held back. A paused job leaves the line *and its executor thread* — `parked`
+  keeps the call and `resume_batch()` resubmits it, behind whatever queued since. Parked
+  jobs notify nobody (they are not over); `cancel()` notifies for one, as it does for a
+  `scheduled` job, or its batch never closes. Parking on the thread instead would let a paused
+  series hold all 64 workers and starve every other download.
+- **Cancelling a batch can take its files with it, and that part is a file deletion.**
+  `cancel_batch()` cancels the waiting jobs before the running one (or a sibling takes the slot it
+  frees), each through `cancel()` so every job still reaches its listeners once. With
+  `delete_files` — which also takes `MANAGE_FILES`, as the file manager's delete does — the
+  episodes already finished leave the library via `remove_download_output()`: video, its `.vtt`
+  siblings, then folders left empty, never outside a configured library and never its root. Their
+  listeners already heard "done" and are not told again; the batch summary is `silence()`d
+  instead, since it would count as downloaded what is gone. A job finishing in the instant after
+  the cancel carries `purge` and removes what it just wrote.
 - **An automatic retry is not a way out of a job.** `_run_download` loops on `_attempt()` up to
   `AUTO_RETRIES` times, `AUTO_RETRY_DELAY` apart, outside the semaphore; the job keeps its id and
   stays `queued` meanwhile, so listeners still fire once, with the final outcome. A manual retry
@@ -385,6 +411,20 @@ anything under a mounted static directory is readable by unauthenticated visitor
   admin). The token itself fails closed — no stored hash means no access — travels only in the
   `Authorization` header (a query string lands in proxy logs), and is not a second server:
   `/mcp` is a route of the panel, in `PUBLIC_PATHS` only because it authenticates itself.
+- **Only a `v*` tag publishes the release image.** `latest` used to move on every push to `main`,
+  so the update button could install commits no release announced. `main` now runs the tests and
+  builds nothing; other branches publish to the `-dev` packages. Merging is not shipping: tag it.
+  `.gitlab-ci.yml` is a separate pipeline and still also builds its default branch.
+- **The panel never holds the Docker socket, and the updater takes no parameters.** `updater/`
+  is a separate, optional image: stdlib only, `network_mode: none`, reached over a Unix socket in a
+  shared volume, with one verb (`docker compose pull` and `up -d --no-deps` on the panel's service,
+  found from compose labels). Mounting the socket in the panel would be root on the host for
+  anything that compromises it, and open mode gives `MANAGE_SETTINGS` to every visitor, so
+  `POST /api/updates/install` refuses with no new release or with a job that a restart would lose.
+  The service owns the state because the panel is what gets replaced. It does not recreate itself:
+  that would kill the process running the command. Its Compose and the host's can disagree on the
+  `com.docker.compose.image` label (measured: v5.6.1 against v2.39), so the other one recreates
+  `web` once on the same image; that is why it compares image ids and skips `up` when they match.
 - Blocking work goes through `asyncio.to_thread` (routers) or the job pool. Notification channels
   are the exception by design: every caller of `notify()` is already off the loop.
 
