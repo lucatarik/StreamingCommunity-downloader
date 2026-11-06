@@ -95,6 +95,10 @@ The end-to-end tests run the real binary against a fake CDN that injects 503s,
   third-party page, guards the candidate, verifies it, and *proposes* it. AnimeUnity has
   no such page, so its candidates are `www.animeunity.<tld>` over a fixed TLD list
   (`AU_TLDS`), probed in parallel under the same guard and the same propose-by-default rule.
+  Before guessing it reads `announcement.py`: the embed form of a public Telegram post
+  (`ANNOUNCEMENT_URL`, env `ANIMEUNITY_ANNOUNCEMENT_URL`, not a settings field) that names the
+  current address. Its text is untrusted like any page: hosts from it are only candidates, and
+  an unreadable post falls back to the TLD probe.
 - `metadata.py` — plot/genres/rating/artwork/trailer, all from the title page's own props,
   behind an in-process TTL cache
 - `naming.py` — the file/folder naming templates and their validation

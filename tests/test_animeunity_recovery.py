@@ -15,7 +15,7 @@ import pytest
 
 from app import config
 from app.auth.permissions import ALL_PERMISSIONS
-from app.core import animeunity, domain_recovery, home
+from app.core import animeunity, announcement, domain_recovery, home
 from tests.conftest import do_setup, make_user, session_for
 
 
@@ -26,6 +26,13 @@ def _reset_module_state():
     yield
     domain_recovery.clear_pending_animeunity()
     domain_recovery._last_au_check_at = None
+
+
+@pytest.fixture(autouse=True)
+def _no_announcement(monkeypatch):
+    """The public post is a network read. These tests are about the TLD probe;
+    test_announcement.py is about the post."""
+    monkeypatch.setattr(announcement, "fetch_hosts", lambda url=None: [])
 
 
 @pytest.fixture

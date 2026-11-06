@@ -322,6 +322,20 @@ def animeunity_candidates(current: str) -> list[str]:
     return [h for h in (f"www.animeunity.{tld}" for tld in AU_TLDS) if h != current]
 
 
+def _announced_hosts() -> list[str]:
+    """The hosts AnimeUnity's public announcement names, or none.
+
+    Never raises: a channel that is down, a post that was deleted or a layout
+    that changed must leave the TLD probe to do its job, not break the check.
+    """
+    try:
+        from app.core import announcement
+        return announcement.fetch_hosts()
+    except Exception as exc:
+        logger.warning("Cannot read the AnimeUnity announcement: %s", exc)
+        return []
+
+
 def _probe_animeunity(host: str) -> tuple[str, str | None]:
     """``(host, None)`` for a usable candidate; otherwise why not.
 
@@ -380,6 +394,7 @@ def run_check_animeunity(force: bool = False) -> dict:
         "applied": False,
         "rejected": [],
         "checked": False,
+        "via": None,
     }
 
     if not force:
@@ -397,7 +412,12 @@ def run_check_animeunity(force: bool = False) -> dict:
         _set_pending_animeunity(None)
         return result
 
-    candidates = animeunity_candidates(result["current"])
+    # The announcement is the one place that actually says where the site is
+    # now. Guessing TLDs is the fallback for when it cannot be read or names
+    # nothing usable.
+    named = [h for h in _announced_hosts() if h != result["current"]]
+    candidates = named or animeunity_candidates(result["current"])
+    result["via"] = "announcement" if named else "tld"
     with ThreadPoolExecutor(max_workers=_AU_PROBE_WORKERS) as pool:
         probes = list(pool.map(_probe_animeunity, candidates))
 
