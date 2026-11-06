@@ -78,9 +78,23 @@ The end-to-end tests run the real binary against a fake CDN that injects 503s,
   `/it`: some hosts serve no locale segment (#34), and the form each host answers
   to is learned from a 404 and remembered per host.
 - `home.py` — the shelves each source publishes on its own front page, behind a TTL
-  cache keyed on `(source, host)`, so a rotation cannot reach the old domain's entry
+  cache keyed on `(source, host)`, so a rotation cannot reach the old domain's entry.
+  StreamingCommunity's home loads "upcoming" and one slider per genre lazily, from
+  `POST /api/sliders/fetch` (page.fetch_sliders — at the host root, no session needed,
+  **six sliders per call at most**); the panel fetches them up front. A failure there
+  keeps the page's own shelves and is cached for a minute, not a quarter of an hour.
+- `archive.py` — each source's catalogue under its own filters (`/api/archive`). The filter
+  *definitions* (keys, options, defaults) are built server-side and sent to the page, which
+  draws whatever it is given; the same definition validates the request. StreamingCommunity
+  reads `/archive` as JSON (60 a page, capped at ~1000 titles for non-premium, so 17 pages);
+  AnimeUnity posts `/archivio/get-animes` (30 a page). AnimeUnity with a `year` fetches the
+  whole year and orders it by `created_at`, newest first (unless an `order` was chosen) —
+  through `animeunity.browse()`, never `_normalize_titles`, whose `MAX_RESULTS` would cut a
+  year to sixty.
 - `domain_recovery.py` — finds the source domain again when it rotates: scrapes a
-  third-party page, guards the candidate, verifies it, and *proposes* it
+  third-party page, guards the candidate, verifies it, and *proposes* it. AnimeUnity has
+  no such page, so its candidates are `www.animeunity.<tld>` over a fixed TLD list
+  (`AU_TLDS`), probed in parallel under the same guard and the same propose-by-default rule.
 - `metadata.py` — plot/genres/rating/artwork/trailer, all from the title page's own props,
   behind an in-process TTL cache
 - `naming.py` — the file/folder naming templates and their validation
@@ -179,10 +193,10 @@ anything under a mounted static directory is readable by unauthenticated visitor
   `require(...)` dependency. `tests/test_permissions.py` fails otherwise.
 - **No ADMIN super-permission.** Flags are independent, so an administrator can exist who never sees
   the request queue.
-- **Two caches are keyed on the source host, and both are also cleared explicitly.**
-  `home` and `metadata` put the domain in the cache key, and `clear_cache()` is called
-  at the only two places the domain is written — `domain_recovery.apply_candidate()`
-  and `PUT /api/domain`. The key is the half that stays correct when a third write
+- **Three caches are keyed on the source host, and all are also cleared explicitly.**
+  `home`, `archive` and `metadata` put the domain in the cache key, and `clear_cache()` is
+  called wherever a host is written — `domain_recovery.apply_candidate()`,
+  `apply_animeunity_candidate()`, `PUT /api/domain` and `PUT /api/domain/hosts`. The key is the half that stays correct when a further write
   site is added and forgets the call; without it the panel served the old domain's
   artwork, and its now-dead image URLs, for six hours after a rotation. Not inside
   `config.update_data()`: that would make `app.config` import `app.core`.
@@ -314,6 +328,20 @@ anything under a mounted static directory is readable by unauthenticated visitor
   deliberately stricter than `PUT /api/domain`, which accepts an empty version string: an admin
   typing a host in is making a decision, a web page is not. `domain_auto_apply` opts out of all of
   this and is off by default.
+- **AnimeUnity's host found automatically is proposed, never adopted, and is checked harder
+  than a typed one.** Same rule as the StreamingCommunity domain, with a different guard:
+  the name must match `AU_NAME_PATTERN` (`animeunity`) under a TLD from `AU_TLDS`, both
+  module constants with env overrides that **must not become settings fields**. A guessed
+  host must also show what the real front page is made of (`verify_animeunity`: the
+  `csrf-token` meta plus `layout-items` or `the-carousel`) — `hosts.verify_animeunity`, which
+  a typed-in host goes through, only looks for the word "animeunity", and a parked domain
+  passes that. Adopting one writes `animeunity_domain` and drops the CSRF token and the host's
+  caches. A healthy host is never replaced, even by "Controlla ora". `domain_auto_apply`
+  covers both sources.
+- **The archive page keeps "the person's choice" and "the default" apart in the address.**
+  `hashFor()` drops empty values, so a cleared filter and an untouched one would be the same
+  link. `#/archive?x=1&…` means the filters in the address are exactly the person's (absent
+  = off); without `x`, the source's defaults apply (AnimeUnity: current year, dubbed).
 - **Title metadata has one provider and needs no credential.** It comes from the title page's own
   props — the payload already fetched to find `tmdb_id` — so it costs no request of its own. Two
   other providers were tried and removed after being measured, and the measurements are the reason:

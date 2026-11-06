@@ -10,7 +10,7 @@ from app import config
 from app.auth.deps import require
 from app.auth.permissions import Permission
 from app.config import get_settings, save_settings
-from app.core import animeunity, domain_recovery, home, hosts, metadata, naming
+from app.core import animeunity, archive, domain_recovery, home, hosts, metadata, naming
 from app.core.paths import validate_library_path
 from app.core.page import get_domain_version
 
@@ -75,16 +75,36 @@ def get_domain_candidate():
     a requester staring at a broken search benefits from being told the source
     has moved even though they cannot be the one to apply it.
     """
-    return {"candidate": domain_recovery.pending()}
+    return {
+        "candidate": domain_recovery.pending(),
+        # Beside, never inside it: "candidate" is StreamingCommunity's and its
+        # readers (the banner, the MCP tools) were written before there was a
+        # second source.
+        "animeunity_candidate": domain_recovery.pending_animeunity(),
+    }
 
 
 @router.post("/check", dependencies=CAN_MANAGE)
 async def check_domain_now():
-    return await asyncio.to_thread(domain_recovery.run_check, True)
+    result = await asyncio.to_thread(domain_recovery.run_check, True)
+    # Both sources, in the answer to one button. A failure of the second says
+    # nothing about the first, so it is reported in its own place.
+    try:
+        result["animeunity"] = await asyncio.to_thread(domain_recovery.run_check_animeunity, True)
+    except Exception:
+        logger.exception("AnimeUnity host check failed")
+        result["animeunity"] = None
+    return result
+
+
+class CandidateApply(DomainUpdate):
+    # Defaults to the source the endpoint was written for, so a client that
+    # predates the second one keeps working unchanged.
+    source: Literal["streamingcommunity", "animeunity"] = "streamingcommunity"
 
 
 @router.post("/candidate/apply", dependencies=CAN_MANAGE)
-async def apply_domain_candidate(body: DomainUpdate):
+async def apply_domain_candidate(body: CandidateApply):
     """Adopt the pending candidate.
 
     The domain in the body is a confirmation token, not an instruction: it must
@@ -92,7 +112,9 @@ async def apply_domain_candidate(body: DomainUpdate):
     own. Taking the host from the request would be exactly the "the source
     domain never comes from the client" rule this endpoint looks like it breaks.
     """
-    candidate = domain_recovery.pending()
+    animeunity_source = body.source == "animeunity"
+    candidate = (domain_recovery.pending_animeunity() if animeunity_source
+                 else domain_recovery.pending())
     if not candidate:
         raise HTTPException(status_code=409, detail="Nessun dominio proposto")
     if body.domain.strip() != candidate["host"]:
@@ -102,15 +124,24 @@ async def apply_domain_candidate(body: DomainUpdate):
         )
 
     try:
-        version = await asyncio.to_thread(domain_recovery.apply_candidate, candidate["host"])
+        if animeunity_source:
+            await asyncio.to_thread(domain_recovery.apply_animeunity_candidate, candidate["host"])
+            version = None
+        else:
+            version = await asyncio.to_thread(domain_recovery.apply_candidate, candidate["host"])
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"domain": candidate["host"], "version": version, "valid": True}
 
 
 @router.post("/candidate/dismiss", dependencies=CAN_MANAGE)
-def dismiss_domain_candidate():
-    domain_recovery.clear_pending()
+def dismiss_domain_candidate(
+    source: Literal["streamingcommunity", "animeunity"] = "streamingcommunity",
+):
+    if source == "animeunity":
+        domain_recovery.clear_pending_animeunity()
+    else:
+        domain_recovery.clear_pending()
     return {"ok": True}
 
 
@@ -168,6 +199,7 @@ async def set_hosts(body: HostsUpdate):
     if "animeunity_domain" in changes:
         animeunity.forget_csrf()
         home.clear_cache("animeunity")
+        archive.clear_cache("animeunity")
     return _hosts_state()
 
 
@@ -339,5 +371,6 @@ async def set_domain(body: DomainUpdate):
 
     _update_data({"domain": domain})
     home.clear_cache("streamingcommunity")
+    archive.clear_cache("streamingcommunity")
     metadata.clear_cache()
     return {"domain": domain, "version": version, "valid": True}

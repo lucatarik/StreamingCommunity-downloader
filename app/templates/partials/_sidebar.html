@@ -7,6 +7,15 @@
       </a>
       <!-- Mobile-only controls: settings icon + hamburger -->
       <div class="d-flex align-items-center gap-2 d-lg-none">
+        <!-- Browser history, to the left of settings. No data-perm: going
+             back is not a privilege, and the settings button next to it is
+             not shown to everyone. -->
+        <button class="btn-icon-mobile" data-action="nav:back" title="Indietro" aria-label="Indietro">
+          <i class="ti ti-arrow-left" style="font-size:19px"></i>
+        </button>
+        <button class="btn-icon-mobile" data-action="nav:forward" title="Avanti" aria-label="Avanti">
+          <i class="ti ti-arrow-right" style="font-size:19px"></i>
+        </button>
         <button class="btn-icon-mobile" data-action="settings:open" title="Impostazioni">
           <i class="ti ti-settings" style="font-size:19px"></i>
         </button>
@@ -80,10 +89,22 @@
             <div class="sb-disk-bar"><span id="sb-disk-fill"></span></div>
             <div class="sb-disk-text" id="sb-disk-text"></div>
           </div>
-          <button class="btn-sidebar-settings" data-perm="MANAGE_SETTINGS" data-action="settings:open">
-            <i class="ti ti-settings" style="font-size:15px;flex-shrink:0"></i>
-            Impostazioni
-          </button>
+          <!-- The arrows live outside the settings button's data-perm: for
+               anyone who cannot open Settings, the row is just the arrows. -->
+          <div class="sb-settings-row">
+            <div class="sb-history">
+              <button class="btn-sidebar-history" data-action="nav:back" title="Indietro" aria-label="Indietro">
+                <i class="ti ti-arrow-left"></i>
+              </button>
+              <button class="btn-sidebar-history" data-action="nav:forward" title="Avanti" aria-label="Avanti">
+                <i class="ti ti-arrow-right"></i>
+              </button>
+            </div>
+            <button class="btn-sidebar-settings" data-perm="MANAGE_SETTINGS" data-action="settings:open">
+              <i class="ti ti-settings" style="font-size:15px;flex-shrink:0"></i>
+              Impostazioni
+            </button>
+          </div>
           <div class="sidebar-version-row">
             <span id="app-version" class="sidebar-version" title="Versione del pannello"></span>
             <button type="button" id="update-badge" class="update-badge" data-action="updates:open" hidden>

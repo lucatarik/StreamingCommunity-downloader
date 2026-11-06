@@ -37,14 +37,24 @@ class _Response:
             raise requests.HTTPError(f"HTTP {self.status_code}")
 
 
+class _JsonResponse(_Response):
+    def __init__(self, body):
+        super().__init__("")
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
 def _sc_title(n, kind="movie"):
     return {"id": n, "name": f"Title {n}", "slug": f"title-{n}", "type": kind,
             "score": "7.7", "seasons_count": 1,
             "images": [{"type": "poster", "filename": f"poster-{n}.webp"}]}
 
 
-def _sc_home(*sliders):
-    payload = {"props": {"sliders": list(sliders)}}
+def _sc_home(*sliders, genres=()):
+    payload = {"props": {"sliders": list(sliders),
+                         "genres": [{"id": i, "name": name} for i, name in enumerate(genres, 1)]}}
     return ('<html><body><div id="app" data-page="'
             + html.escape(json.dumps(payload), quote=True)
             + '"></div></body></html>')
@@ -53,7 +63,8 @@ def _sc_home(*sliders):
 @pytest.fixture
 def sc(monkeypatch):
     """Serve the StreamingCommunity front page, and count the requests for it."""
-    state = {"html": _sc_home(), "calls": [], "error": None}
+    state = {"html": _sc_home(), "calls": [], "error": None,
+             "posts": [], "post_error": None, "sliders": []}
 
     def fake_get(url, *args, **kwargs):
         state["calls"].append(url)
@@ -61,7 +72,19 @@ def sc(monkeypatch):
             raise state["error"]
         return _Response(state["html"])
 
+    def fake_post(url, *args, json=None, **kwargs):
+        # The lazy sliders: the specs asked for, answered from state["sliders"]
+        # by name (and genre, for the genre ones).
+        state["posts"].append((url, json))
+        if state["post_error"]:
+            raise state["post_error"]
+        wanted = [(s["name"], s["genre"]) for s in json["sliders"]]
+        body = [s for s in state["sliders"]
+                if (s["name"], s.get("label") if s["name"] == "genre" else None) in wanted]
+        return _JsonResponse(body)
+
     monkeypatch.setattr(page.requests, "get", fake_get)
+    monkeypatch.setattr(page.requests, "post", fake_post)
     return state
 
 
@@ -309,3 +332,66 @@ def test_setting_the_domain_by_hand_clears_the_shelves(client, signed_in, sc, mo
 
     assert response.status_code == 200
     assert home._cached(home._cache_key("streamingcommunity", "old.test")) is None
+
+
+# ── The lazy shelves ──────────────────────────────────────────────────────────
+#
+# The source's home loads "upcoming" and one slider per genre as you scroll, from
+# an endpoint that takes six at a time. The panel renders the whole page at once,
+# so it fetches them up front.
+
+def test_the_lazy_sliders_follow_the_pages_own(sc):
+    sc["html"] = _sc_home({"name": "trending", "titles": [_sc_title(1)]},
+                          genres=["Azione", "Horror"])
+    sc["sliders"] = [
+        {"name": "upcoming", "label": "In arrivo", "titles": [_sc_title(2)]},
+        {"name": "genre", "label": "Azione", "titles": [_sc_title(3)]},
+        {"name": "genre", "label": "Horror", "titles": [_sc_title(4)]},
+    ]
+
+    result = home.shelves("streamingcommunity", "source.test")
+
+    # Genre sliders are all called "genre": the label is what keeps the keys apart.
+    assert [s["key"] for s in result] == ["trending", "upcoming", "genre:Azione", "genre:Horror"]
+    assert [s["title"] for s in result] == ["Di tendenza", "In arrivo", "Azione", "Horror"]
+
+
+def test_the_lazy_sliders_are_asked_for_in_lots_the_source_accepts(sc):
+    genres = [f"Genere {n}" for n in range(13)]
+    sc["html"] = _sc_home(genres=genres)
+
+    home.shelves("streamingcommunity", "source.test")
+
+    sizes = [len(body["sliders"]) for _, body in sc["posts"]]
+    assert sizes == [6, 6, 2]            # upcoming + thirteen genres
+    # At the root of the host: under the locale segment the route is a 404.
+    assert all(url == "https://source.test/api/sliders/fetch" for url, _ in sc["posts"])
+
+
+def test_a_failed_lazy_fetch_keeps_the_pages_own_shelves_and_retries_soon(sc, monkeypatch):
+    sc["html"] = _sc_home({"name": "trending", "titles": [_sc_title(1)]}, genres=["Azione"])
+    sc["post_error"] = requests.ConnectionError("no route")
+
+    result = home.shelves("streamingcommunity", "source.test")
+
+    assert [s["key"] for s in result] == ["trending"]
+
+    # Held for a minute, not a quarter of an hour: the missing part is a failure
+    # to retry. Inside the minute it costs nothing; after it, it is asked again.
+    home.shelves("streamingcommunity", "source.test")
+    assert len(sc["posts"]) == 1
+
+    sc["post_error"] = None
+    sc["sliders"] = [{"name": "genre", "label": "Azione", "titles": [_sc_title(3)]}]
+    monkeypatch.setattr(home, "_now", lambda: home.time.time() + home._PARTIAL_TTL + 5)
+
+    assert [s["key"] for s in home.shelves("streamingcommunity", "source.test")] \
+        == ["trending", "genre:Azione"]
+
+
+def test_the_featured_carousel_is_not_cut_at_thirty(au):
+    au["html"] = _au_home([], [_au_record(n) for n in range(1, 44)])
+
+    result = home.shelves("animeunity", "au.test")
+
+    assert [len(s["items"]) for s in result if s["key"] == "featured"] == [43]

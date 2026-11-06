@@ -29,6 +29,25 @@
           </div>
         </div>
 
+        <!-- AnimeUnity's own: the two sources move independently. -->
+        <div id="au-domain-banner" class="alert domain-banner mb-4" role="status" style="display:none">
+          <div class="d-flex align-items-center gap-2 flex-wrap">
+            <i class="ti ti-world-search"></i>
+            <div class="flex-fill">
+              <strong>AnimeUnity ha cambiato indirizzo.</strong>
+              Trovato <code id="au-domain-banner-host"></code>, verificato dal pannello.
+            </div>
+            <button class="btn btn-sm btn-primary" data-perm="MANAGE_SETTINGS"
+                    data-action="domain:apply" data-source="animeunity" id="au-domain-banner-apply">
+              Applica
+            </button>
+            <button class="btn btn-sm btn-ghost-secondary" data-perm="MANAGE_SETTINGS"
+                    data-action="domain:dismiss" data-source="animeunity">
+              Ignora
+            </button>
+          </div>
+        </div>
+
 {% include 'pages/_title.html' %}
 {% include 'pages/_settings.html' %}
 
@@ -74,6 +93,28 @@
           <div id="search-results" class="row g-3"></div>
           <div id="search-more" class="text-center mt-4" style="display:none">
             <button class="source-btn" id="search-more-btn" data-action="search:more">
+              <i class="ti ti-plus"></i>Carica altri
+            </button>
+          </div>
+        </div>
+
+        <!-- ── Archive ─────────────────────────────────────────── -->
+        <!-- The whole catalogue under the source's own filters. The filter
+             controls are not in this markup: the server sends the list of
+             them (/api/archive/filters) and page-archive.js draws it. -->
+        <div id="page-archive" style="display:none">
+          <div class="pg-head">
+            <div class="pg-head-main">
+              <h1 class="pg-h1">Archivio</h1>
+              <p class="pg-sub" id="archive-sub"></p>
+            </div>
+            <div class="pg-actions source-selector" id="archive-sources"></div>
+          </div>
+          <div id="archive-filters" class="archive-filters"></div>
+          <div id="archive-count" class="archive-count"></div>
+          <div id="archive-results" class="row g-3"></div>
+          <div id="archive-more" class="text-center mt-4" style="display:none">
+            <button class="source-btn" id="archive-more-btn" data-action="archive:more">
               <i class="ti ti-plus"></i>Carica altri
             </button>
           </div>
@@ -340,6 +381,7 @@
      app.js — the entry point, which owns the boot listener — is last. -->
 <script src="{{ asset('router.js') }}"></script>
 <script src="{{ asset('page-search.js') }}"></script>
+<script src="{{ asset('page-archive.js') }}"></script>
 <script src="{{ asset('page-title.js') }}"></script>
 <script src="{{ asset('page-downloads.js') }}"></script>
 <script src="{{ asset('page-requests.js') }}"></script>

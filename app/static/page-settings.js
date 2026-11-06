@@ -789,6 +789,17 @@ async function checkDomainNow() {
         why ? `Nessun dominio adottabile. Scartati: ${why}` : 'Nessun dominio trovato.',
         'danger');
     }
+    // AnimeUnity answers in the same call. It is added to the line rather than
+    // replacing it: the line above is about the source the button was written for.
+    const au = data.animeunity;
+    const base = document.getElementById('domain-recovery-feedback').textContent;
+    if (au && au.applied) {
+      _feedback('domain-recovery-feedback', `${base} AnimeUnity: applicato ${au.candidate}.`, 'success');
+    } else if (au && au.candidate) {
+      _feedback('domain-recovery-feedback', `${base} AnimeUnity: trovato ${au.candidate}, da applicare.`, 'success');
+    } else if (au && !au.current_ok) {
+      _feedback('domain-recovery-feedback', `${base} AnimeUnity: nessun indirizzo trovato.`, 'danger');
+    }
     await loadDomainCandidate();
   } catch (e) { _feedback('domain-recovery-feedback', 'Errore di rete.', 'danger'); }
   finally { btn.disabled = false; }

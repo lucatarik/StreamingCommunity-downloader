@@ -118,7 +118,11 @@ function renderSearchFilters() {
       `<button class="source-btn${_resultsView === view ? ' active' : ''}" ` +
       `data-action="search:view" data-view="${view}" title="${label}" aria-label="${label}">` +
       `<i class="ti ${icon}"></i></button>`).join('');
-  bar.innerHTML = chips + dub + `<div class="results-view">${views}</div>`;
+  // The archive: the whole catalogue with the source's own filters, one click
+  // from the kind chips it extends.
+  const archive = '<button class="source-btn" data-action="archive:open">' +
+                  '<i class="ti ti-archive"></i>Archivio</button>';
+  bar.innerHTML = chips + dub + archive + `<div class="results-view">${views}</div>`;
   _applyResultsView();
 }
 
@@ -136,9 +140,19 @@ let _resultsView = (() => {
   catch (e) { return 'grid'; }
 })();
 
+// Every place that lists cards follows the choice: the search results, the
+// start page's shelves (where "grid" is the rails and "list" stacks them into
+// rows) and the archive.
+const _RESULTS_VIEW_HOSTS = ['search-results', 'home-shelves', 'archive-results'];
+
 function _applyResultsView() {
-  const container = document.getElementById('search-results');
-  if (container) container.classList.toggle('results-list', _resultsView === 'list');
+  _RESULTS_VIEW_HOSTS.forEach(id => {
+    const container = document.getElementById(id);
+    if (container) container.classList.toggle('results-list', _resultsView === 'list');
+  });
+  // A rail that stopped being one has no arrows to show, and one that became a
+  // rail again has to measure itself.
+  _syncShelfArrows();
 }
 
 function setResultsView(view) {
@@ -212,7 +226,11 @@ function renderResultCards(items, container, baseIndex,
     card.className = wrapperClass;
     card.dataset.idx = String(idx);
     const posterHtml = posterUrl
-      ? `<img src="${posterUrl}" alt="" onerror="posterError(this)">`
+      // Lazy: a start page is dozens of shelves of thirty posters, and each
+      // one is a request through the image proxy. .poster-wrap has a fixed
+      // aspect ratio, so an image that has not loaded still takes its place
+      // and the browser knows which ones are actually near the screen.
+      ? `<img src="${posterUrl}" alt="" loading="lazy" decoding="async" onerror="posterError(this)">`
       : '';
     // Movie cards carry no status ribbon: a movie can be requested again
     // freely (denied/failed/cancelled never block it), so a "richiesto" chip
@@ -427,17 +445,32 @@ function _renderHeroArt(items) {
     .join('');
 }
 
+// A start page is dozens of shelves, and building every card of every one up
+// front is what made it slow: thirty shelves of thirty cards is nine hundred
+// nodes and as many image elements before anything can be read. So each shelf is
+// only a heading and an empty rail until it comes near the screen, and its
+// cards are built then. The items themselves are all indexed at once, so
+// openTitle(idx) needs no special case for a shelf that is not built yet.
+let _shelfObserver = null;
+
 function renderShelves() {
   const host = document.getElementById('home-shelves');
   const shelves = _homeCache[currentSource] || [];
+  if (_shelfObserver) _shelfObserver.disconnect();
   host.innerHTML = '';
-  // One flat array across every rail, reset once here and appended to in order,
-  // so openTitle(idx) needs no special case for the start page.
+  // One flat array across every rail, reset once here and appended to in order.
   _searchResults = [];
   _requestStatus = {};
-  const ribbonIds = [];
 
   _shelfSyncs = [];
+  _shelfObserver = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      _shelfObserver.unobserve(entry.target);
+      _fillShelf(entry.target);
+    });
+  }, {rootMargin: '600px 0px'});
+
   shelves.forEach(shelf => {
     const section = document.createElement('div');
     section.className = 'shelf';
@@ -450,17 +483,23 @@ function renderShelves() {
         '<button class="shelf-arrow shelf-arrow-next" hidden aria-label="Titoli successivi">' +
           '<i class="ti ti-chevron-right"></i></button>' +
       '</div>';
-    renderResultCards(shelf.items, section.querySelector('.shelf-rail'),
-                      _searchResults.length, 'shelf-item');
+    section._items = shelf.items;
+    section._base = _searchResults.length;
     _searchResults = _searchResults.concat(shelf.items);
-    shelf.items.forEach(i => { if (i.type !== 'movie') ribbonIds.push(String(i.id)); });
     host.appendChild(section);
-    _shelfSyncs.push(_wireShelfArrows(section));
+    _shelfObserver.observe(section);
   });
   _renderHeroArt(_searchResults);
-
   applyClientFilter();
-  loadRequestStatuses(ribbonIds);
+}
+
+function _fillShelf(section) {
+  const items = section._items;
+  renderResultCards(items, section.querySelector('.shelf-rail'), section._base, 'shelf-item');
+  section._filled = true;
+  _shelfSyncs.push(_wireShelfArrows(section));
+  _filterShelf(section);
+  loadRequestStatuses(items.filter(i => i.type !== 'movie').map(i => String(i.id)));
 }
 
 // The arrows scroll a few titles at a time rather than a whole screenful: the
@@ -513,19 +552,24 @@ function itemMatchesFilter(item) {
 // variant of them to ask for, and no paging to keep honest. So the chips hide
 // cards instead of refetching — instant, and it cannot desynchronise an index,
 // because nothing is removed and nothing is reordered.
+// Decided from the items, not from the cards, so a shelf that is not built yet
+// is hidden or shown correctly too — and built already filtered when it is.
+function _filterShelf(section) {
+  const items = section._items;
+  let visible = 0;
+  items.forEach((item, i) => { if (itemMatchesFilter(item)) visible++; });
+  section.classList.toggle('d-none', visible === 0);
+  if (!section._filled) return;
+  section.querySelectorAll('.shelf-item').forEach(card => {
+    const item = _searchResults[Number(card.dataset.idx)];
+    card.classList.toggle('d-none', !!item && !itemMatchesFilter(item));
+  });
+}
+
 function applyClientFilter() {
   const host = document.getElementById('home-shelves');
   if (!host) return;
-  host.querySelectorAll('.shelf').forEach(section => {
-    let visible = 0;
-    section.querySelectorAll('.shelf-item').forEach(card => {
-      const item = _searchResults[Number(card.dataset.idx)];
-      const show = !item || itemMatchesFilter(item);
-      card.classList.toggle('d-none', !show);
-      if (show) visible++;
-    });
-    section.classList.toggle('d-none', visible === 0);
-  });
+  host.querySelectorAll('.shelf').forEach(_filterShelf);
   _syncShelfArrows();
 }
 
@@ -550,19 +594,30 @@ const STATUS_RIBBONS = {
   cancelled:       { label: 'Annullato',    cls: 'ribbon-denied',    icon: 'ti-ban' },
 };
 
+// The endpoint takes a hundred ids at most, and a start page with every genre
+// shelf holds several times that.
+const _STATUS_CHUNK = 100;
+
 async function loadRequestStatuses(externalIds) {
-  if (!externalIds.length || !(can('REQUEST') || can('DOWNLOAD'))) return;
-  try {
-    const statuses = await api.post('/api/requests/status',
-      { source: currentSource, external_ids: externalIds });
-    // Merged, not replaced. Called with only the new page's ids, an
-    // assignment would wipe every ribbon already painted on the pages
-    // before it, because renderRequestRibbons re-reads the whole map.
-    // Staleness is bounded: _requestStatus is cleared on every fresh
-    // search and on a source switch.
-    Object.assign(_requestStatus, statuses);
-    renderRequestRibbons();
-  } catch (e) { /* the cards simply stay plain */ }
+  // One title can sit on several shelves; asking about it once is enough.
+  const ids = [...new Set(externalIds)];
+  if (!ids.length || !(can('REQUEST') || can('DOWNLOAD'))) return;
+  const source = currentSource;
+  for (let i = 0; i < ids.length; i += _STATUS_CHUNK) {
+    try {
+      const statuses = await api.post('/api/requests/status',
+        { source, external_ids: ids.slice(i, i + _STATUS_CHUNK) });
+      // The source was switched while this was in flight: those cards are gone.
+      if (source !== currentSource) return;
+      // Merged, not replaced. Called with only the new page's ids, an
+      // assignment would wipe every ribbon already painted on the pages
+      // before it, because renderRequestRibbons re-reads the whole map.
+      // Staleness is bounded: _requestStatus is cleared on every fresh
+      // search and on a source switch.
+      Object.assign(_requestStatus, statuses);
+      renderRequestRibbons();
+    } catch (e) { /* the cards simply stay plain */ }
+  }
 }
 
 const IN_LIBRARY_STATUSES = new Set(['completed', 'available']);

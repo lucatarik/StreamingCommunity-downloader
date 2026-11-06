@@ -172,7 +172,7 @@
       0%, 100% { opacity: 1; transform: scale(1); }
       50%       { opacity: .35; transform: scale(.75); }
     }
-    .stream-dot { animation: dot-pulse 2.6s ease-in-out infinite; }
+
 
     /* Domain badge */
     #domain-badge {
@@ -225,12 +225,36 @@
       font-size: 13px;
       font-weight: 500;
       cursor: pointer;
-      transition: all .15s;
-      width: 100%;
+      transition: background-color .15s, border-color .15s, color .15s;
+      flex: 1;
+      min-width: 0;
       text-align: left;
     }
 
     .btn-sidebar-settings:hover {
+      background: var(--bg-hover);
+      color: var(--text-sub);
+      border-color: var(--border-strong);
+    }
+
+    /* Back / forward, to the left of Settings. The row owns the width the
+       settings button used to claim for itself. */
+    .sb-settings-row { display: flex; align-items: stretch; gap: 6px; }
+    .sb-history { display: flex; gap: 6px; }
+    .btn-sidebar-history {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      border-radius: var(--radius-xs);
+      background: transparent;
+      border: 1px solid var(--border-mid);
+      color: var(--text-muted);
+      font-size: 15px;
+      cursor: pointer;
+      transition: background-color .15s, border-color .15s, color .15s;
+    }
+    .btn-sidebar-history:hover {
       background: var(--bg-hover);
       color: var(--text-sub);
       border-color: var(--border-strong);
@@ -410,7 +434,7 @@
       align-items: center;
       justify-content: center;
       cursor: pointer;
-      transition: all .15s;
+      transition: background-color .15s, border-color .15s, color .15s;
       flex-shrink: 0;
     }
     .btn-icon-mobile:hover {

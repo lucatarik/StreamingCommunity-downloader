@@ -71,7 +71,7 @@
       font-size: 12px;
       font-weight: 600;
       cursor: pointer;
-      transition: all .15s;
+      transition: background-color .15s, border-color .15s, color .15s;
       display: flex;
       align-items: center;
       gap: 5px;
@@ -123,12 +123,27 @@
       .results-list .card-meta .card-title-text { font-size: 13px; }
     }
 
+    /* The start page in list mode: each shelf stops being a rail and stacks
+       its titles as rows. The row layout itself is the .results-list rules
+       above; this only undoes what makes a shelf scroll sideways. */
+    #home-shelves.results-list .shelf-rail {
+      flex-direction: column;
+      gap: 8px;
+      overflow: visible;
+      scroll-snap-type: none;
+    }
+    #home-shelves.results-list .shelf-item { flex: 0 0 auto; width: 100%; }
+    #home-shelves.results-list .shelf-arrow { display: none !important; }
+
     #search-more .source-btn { display: inline-flex; }
 
     /* ═══════════════════════════════════════════════════════
        START PAGE — the source's own shelves
        ═══════════════════════════════════════════════════════ */
-    .shelf { margin-bottom: 26px; }
+    /* Off-screen shelves are neither laid out nor painted; the intrinsic size
+       keeps the scrollbar honest until they are. */
+    .shelf { margin-bottom: 26px; content-visibility: auto; contain-intrinsic-size: auto 290px; }
+    .shelf-rail:empty { min-height: 244px; }
     .shelf-head {
       display: flex;
       align-items: baseline;
@@ -155,7 +170,7 @@
          the wrapper cancels it so the rail can reach the edge of the page,
          and this puts the first and last poster back in line with every
          other element on the page. */
-      padding: 8px calc(var(--bs-gutter-x, 1.5rem) / 2) 10px;
+      padding: 8px .75rem 10px;
       margin: 0;
       scrollbar-width: thin;
     }
@@ -174,7 +189,7 @@
        could fall outside the visible area entirely. */
     .shelf-rail-wrap {
       position: relative;
-      margin-inline: calc(var(--bs-gutter-x, 1.5rem) / -2);
+      margin-inline: -.75rem;
       min-width: 0;
     }
     .shelf-arrow {
@@ -184,6 +199,7 @@
       /* The whole strip is the target, full rail height by this width — the
          chip below is only what you see of it. */
       width: 56px;
+      background: transparent;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -205,13 +221,9 @@
       border-radius: 50%;
       background: var(--bg-raised);
       border: 1px solid var(--border-mid);
-      box-shadow: 0 6px 20px rgba(0,0,0,.4);
-      transition: background .15s, transform .15s;
+      transition: background-color .15s;
     }
-    .shelf-arrow:hover i {
-      background: var(--bg-hover);
-      transform: scale(1.06);
-    }
+    .shelf-arrow:hover i { background: var(--bg-hover); }
     .shelf-arrow[hidden] { display: none; }
     .shelf-rail-wrap:hover .shelf-arrow,
     .shelf-arrow:focus-visible { opacity: 1; }
@@ -220,11 +232,9 @@
        against the posters. */
     .shelf-arrow-prev {
       left: 0;
-      background: linear-gradient(to right, var(--bg-base) 45%, rgba(7,10,18,0));
     }
     .shelf-arrow-next {
       right: 0;
-      background: linear-gradient(to left, var(--bg-base) 45%, rgba(7,10,18,0));
     }
     .shelf-arrow:hover { color: var(--accent); }
     /* Nothing hovers on a touch screen, and a finger already scrolls the rail. */
@@ -250,14 +260,13 @@
       background: var(--bg-surface) !important;
       border: 1px solid var(--border) !important;
       overflow: hidden !important;
-      transition: transform .22s cubic-bezier(.34,1.56,.64,1), box-shadow .22s, border-color .22s !important;
+      transition: transform .12s, border-color .12s !important;
       display: flex;
       flex-direction: column;
     }
 
     .result-card:hover {
-      transform: translateY(-7px) scale(1.015) !important;
-      box-shadow: 0 14px 40px rgba(0,0,0,.35) !important;
+      transform: translateY(-4px) !important;
       border-color: var(--border-strong) !important;
     }
 
@@ -273,22 +282,14 @@
       width: 100%; height: 100%;
       object-fit: cover;
       display: block;
-      transition: transform .32s ease;
     }
-
-    .result-card:hover .poster-wrap img { transform: scale(1.05); }
 
     .poster-overlay {
       position: absolute;
       inset: 0;
-      background: linear-gradient(
-        to top,
-        rgba(7,10,18,.96) 0%,
-        rgba(7,10,18,.35) 45%,
-        transparent 100%
-      );
+      background: rgba(7,10,18,.55);
       opacity: 0;
-      transition: opacity .22s;
+      transition: opacity .12s;
     }
 
     .result-card:hover .poster-overlay { opacity: 1; }
@@ -296,22 +297,17 @@
     .poster-play {
       position: absolute;
       top: 50%; left: 50%;
-      transform: translate(-50%, -50%) scale(.7);
+      transform: translate(-50%, -50%);
       width: 46px; height: 46px;
-      background: rgba(255,255,255,.12);
-      backdrop-filter: blur(10px);
-      -webkit-backdrop-filter: blur(10px);
+      background: rgba(255,255,255,.2);
       border-radius: 50%;
       display: flex; align-items: center; justify-content: center;
       font-size: 18px; color: #fff;
       opacity: 0;
-      transition: opacity .22s, transform .22s cubic-bezier(.34,1.56,.64,1);
+      transition: opacity .12s;
     }
 
-    .result-card:hover .poster-play {
-      opacity: 1;
-      transform: translate(-50%, -50%) scale(1);
-    }
+    .result-card:hover .poster-play { opacity: 1; }
 
     .poster-noimg {
       width: 100%; height: 100%;
@@ -700,7 +696,7 @@
     .skeleton {
       background: var(--text-muted);
       border-radius: var(--radius-sm);
-      animation: skeleton-pulse 1.2s ease-in-out infinite;
+      opacity: .2;
     }
     .skeleton-card {
       aspect-ratio: 2/3;
@@ -772,7 +768,7 @@
       background: var(--bg-surface); border: 1px solid var(--border);
       color: var(--text-sub); border-radius: 20px;
       padding: 5px 13px; font-size: 12px; cursor: pointer;
-      transition: all .15s ease;
+      transition: background-color .15s, border-color .15s, color .15s;
     }
     .queue-filter:hover { background: var(--bg-hover); color: var(--text); }
     .queue-filter.active {
@@ -915,7 +911,7 @@
       background: var(--bg-input); border: 1px solid var(--border);
       border-radius: 20px; padding: 3px 10px 3px 8px;
       font-size: 11px; color: var(--text-sub); cursor: pointer;
-      transition: all .15s ease;
+      transition: background-color .15s, border-color .15s, color .15s;
     }
     .perm-chip:hover { border-color: var(--border-strong); color: var(--text); }
     /* The state lives on the chip, not in a box beside it. Same idiom as the
@@ -1267,32 +1263,28 @@
        and faded out before it reaches the text. */
     .sh-art {
       position: absolute;
-      inset: -24px calc(-.5 * var(--bs-gutter-x, 1.5rem)) 0;
+      inset: -24px -.75rem 0;
       z-index: -1;
       display: flex; gap: 8px;
       overflow: hidden;
       border-radius: var(--radius-lg);
-      -webkit-mask-image: linear-gradient(to bottom, #000 0%, transparent 88%);
-      mask-image: linear-gradient(to bottom, #000 0%, transparent 88%);
     }
     .sh-art > span {
       flex: 1 1 0;
       background-size: cover; background-position: center 18%;
-      opacity: .22;
-      filter: blur(1.5px) saturate(.85);
+      opacity: .2;
     }
     /* The headline must win over whatever poster lands behind it. */
     .sh-hero::before {
       content: '';
-      position: absolute; inset: -24px calc(-.5 * var(--bs-gutter-x, 1.5rem)) 0;
+      position: absolute; inset: -24px -.75rem 0;
       z-index: -1;
-      background: linear-gradient(100deg, var(--bg-base) 22%, rgba(7,10,18,.55) 68%, rgba(7,10,18,.25) 100%);
+      background: rgba(7,10,18,.6);
     }
     @media (max-width: 767px) {
       /* Three posters at phone width is a texture, seven is noise. */
       .sh-art > span:nth-child(n+4) { display: none; }
     }
-    @media (prefers-reduced-motion: reduce) { .sh-art > span { filter: none; } }
     .sh-title {
       font-family: var(--font-brand);
       font-size: clamp(30px, 4.2vw, 46px);
@@ -1302,9 +1294,7 @@
     /* The one gradient in the interface. Spending it here keeps it an accent
        rather than a texture. */
     .sh-accent {
-      background: linear-gradient(96deg, var(--accent) 0%, var(--purple) 96%);
-      -webkit-background-clip: text; background-clip: text;
-      -webkit-text-fill-color: transparent; color: transparent;
+      color: var(--accent);
     }
     .sh-sub { color: var(--text-muted); font-size: 14px; margin: 0; }
 
@@ -1388,3 +1378,64 @@
     }
     .settings-page .nav-tabs::-webkit-scrollbar { display: none; }
     .settings-page .nav-tabs .nav-link { white-space: nowrap; }
+
+    /* ═══════════════════════════════════════════════════════
+       ARCHIVE — the source's catalogue under its own filters
+       ═══════════════════════════════════════════════════════ */
+    .archive-filters {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+      gap: 10px 12px;
+      align-items: end;
+      margin-bottom: 14px;
+    }
+    .arc-filter { min-width: 0; }
+    .arc-filter-wide { grid-column: span 2; }
+    @media (max-width: 575px) { .arc-filter-wide { grid-column: 1 / -1; } }
+    .arc-label {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: .4px;
+    }
+    .arc-filter .source-btn { height: 31px; }
+    .archive-count { min-height: 18px; margin-bottom: 8px; font-size: 12px; color: var(--text-muted); }
+
+    /* A multi-select that is a <details>: native open/close, no script for it.
+       The summary borrows .form-select so it reads like its neighbours. */
+    .arc-multi { position: relative; }
+    .arc-multi > summary { list-style: none; cursor: pointer; display: flex; align-items: center; }
+    .arc-multi > summary::-webkit-details-marker { display: none; }
+    .arc-multi-menu {
+      position: absolute;
+      z-index: 30;
+      left: 0;
+      right: 0;
+      min-width: 200px;
+      max-height: 300px;
+      overflow-y: auto;
+      margin-top: 4px;
+      padding: 6px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-xs);
+      box-shadow: 0 12px 32px rgba(0,0,0,.35);
+    }
+    .arc-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 6px;
+      border-radius: 4px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .arc-check:hover { background: var(--bg-hover); }
+
+    /* The archive's results follow the grid/list choice like the search's. */
+    #archive-results.results-list { --bs-gutter-y: .5rem; }
+    #archive-results.results-list > [class*="col-"] { flex: 0 0 100%; width: 100%; max-width: 100%; }
+    #archive-more .source-btn { display: inline-flex; }

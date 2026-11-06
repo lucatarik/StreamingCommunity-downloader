@@ -176,6 +176,9 @@ def normalize_title(t: dict) -> dict | None:
         "studio": t.get("studio") or "",
         "status": t.get("status") or "",
         "season": t.get("season") or "",
+        # When the source added the record - not the year it aired. The archive
+        # orders a whole year by it, newest first.
+        "created_at": t.get("created_at") or "",
         # The romaji or Japanese title, when it differs from the one shown.
         "original_name": (t.get("title") or "") if (t.get("title") or "") != title_str else "",
     }
@@ -251,6 +254,35 @@ def search(query: str, *, page: int = 1, media_type: str | None = None,
     # gives. This used to raise, which reached the panel as a red error box
     # saying the search had broken when the query simply matched nothing.
     return _normalize_titles(records)
+
+
+def browse(filters: dict, offset: int = 0) -> tuple[list[dict], int | None]:
+    """One page of the archive under the source's own filters: the raw records
+    and the source's count of everything that matches.
+
+    Raw, and not normalised here, on purpose: ``_normalize_titles`` stops at
+    ``MAX_RESULTS``, which is right for a search page and would silently cut a
+    whole year of the archive short. The caller that pages through everything
+    decides what to keep.
+
+    ``filters`` carries what the archive page has: ``title``, ``type``,
+    ``year``, ``order``, ``status``, ``season``, ``genres`` (``{id, name}``
+    objects, which is how the source takes them) and ``dubbed``. An unset one is
+    left out of the body rather than sent as an empty value.
+    """
+    body = {k: v for k, v in filters.items() if v not in (None, "", [], False)}
+    body["offset"] = offset
+    if body.get("dubbed"):
+        body["dubbed"] = 1
+
+    r = _post_archive(body)
+    if not r.ok:
+        logger.error("Archive browse failed with status %d", r.status_code)
+        raise RuntimeError(f"AnimeUnity archive failed: HTTP {r.status_code}")
+    payload = r.json()
+    if isinstance(payload, list):
+        return payload, None
+    return payload.get("records", []), payload.get("tot")
 
 
 def get_episodes(anime_id: str) -> list[dict]:

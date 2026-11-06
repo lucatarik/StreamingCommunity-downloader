@@ -26,6 +26,7 @@ import re
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import requests
@@ -33,7 +34,7 @@ from bs4 import BeautifulSoup
 
 from app import config
 from app.core.headers import get_headers
-from app.core import home, metadata
+from app.core import animeunity, archive, home, metadata
 from app.core.page import get_domain_version
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,28 @@ _HOST_RE = re.compile(r"^[a-z0-9.-]{4,253}$")
 # Hosts that are never a public streaming site, whatever DNS says.
 _LOCAL_SUFFIXES = (".local", ".internal", ".localhost", ".home", ".lan")
 
+# AnimeUnity moves between TLDs and publishes no page that says where. So its
+# candidates are not read from anywhere: they are the one name it has always
+# gone by, tried under the TLDs it (or its clones) have used. The name and the
+# list are module constants with env overrides and **must not become settings
+# fields**, for the same reason NAME_PATTERN must not: a text box that relaxes
+# this is a text box that relaxes the guard. A TLD nobody foresaw is typed in by
+# hand under Settings › Sorgente, which is a decision made by a person.
+AU_NAME_PATTERN = re.compile(os.getenv("ANIMEUNITY_NAME_PATTERN", r"^animeunity$"))
+AU_TLDS = tuple(
+    t.strip().lower().lstrip(".")
+    for t in os.getenv(
+        "ANIMEUNITY_DOMAIN_TLDS",
+        "so,to,co,tv,cc,bz,ws,org,net,com,me,sh,io,vip,xyz,site,top,one,info",
+    ).split(",")
+    if t.strip()
+)
+
+# Probing a TLD costs a DNS lookup and, for the few that exist, a page load. Dead
+# ones answer at once; this bounds the ones that do not.
+_AU_PROBE_TIMEOUT = 8
+_AU_PROBE_WORKERS = 8
+
 # The page carries a handful of links, most of them telegra.ph's own. Anything
 # past this is not a candidate list, it is a different page.
 _MAX_CANDIDATES = 5
@@ -74,6 +97,10 @@ _MIN_CHECK_INTERVAL = 600
 _lock = threading.Lock()
 _pending: dict | None = None
 _last_check_at: float | None = None
+# AnimeUnity has its own candidate and its own throttle: the two sources move
+# independently, and one's check must not postpone the other's.
+_pending_au: dict | None = None
+_last_au_check_at: float | None = None
 
 
 def _now() -> float:
@@ -108,8 +135,13 @@ def fetch_candidates(url: str | None = None) -> list[str]:
 
 # ── The guard ─────────────────────────────────────────────────────────────────
 
-def _check_shape(host: str) -> str | None:
-    """Syntactic rejection reason, or None if the host looks like a candidate."""
+def _check_shape(host: str, name_pattern: re.Pattern | None = None) -> str | None:
+    """Syntactic rejection reason, or None if the host looks like a candidate.
+
+    ``name_pattern`` is the source's own allowed name; StreamingCommunity's is
+    the default. Everything else — second-level only, no IPs, no local names —
+    is the same for both.
+    """
     if not host or not _HOST_RE.match(host):
         return "forma non valida"
     if host.endswith(_LOCAL_SUFFIXES) or host == "localhost":
@@ -133,7 +165,7 @@ def _check_shape(host: str) -> str | None:
         return "non è un dominio di secondo livello"
 
     name = labels[0]
-    if not NAME_PATTERN.match(name):
+    if not (name_pattern or NAME_PATTERN).match(name):
         return f"nome «{name}» non riconosciuto"
     return None
 
@@ -171,14 +203,14 @@ def _resolves_to_public(host: str) -> bool:
     return True
 
 
-def is_plausible(host: str) -> tuple[bool, str]:
+def is_plausible(host: str, name_pattern: re.Pattern | None = None) -> tuple[bool, str]:
     """Whether this host may be adopted, and why not when it may not.
 
     The reason is returned rather than logged and dropped: a rebranded source is
     indistinguishable from an attack from in here, and the administrator who has
     to tell them apart needs to see what was refused.
     """
-    reason = _check_shape(host)
+    reason = _check_shape(host, name_pattern)
     if reason:
         return False, reason
     if not _resolves_to_public(host):
@@ -237,10 +269,172 @@ def apply_candidate(host: str) -> str:
     config.update_data({"domain": host})
     # The shelves and the artwork are the old domain's until they are dropped.
     home.clear_cache("streamingcommunity")
+    archive.clear_cache("streamingcommunity")
     metadata.clear_cache()
     clear_pending()
     logger.info("Source domain set to %s (version %s)", host, version)
     return version
+
+
+# ── AnimeUnity ────────────────────────────────────────────────────────────────
+
+def pending_animeunity() -> dict | None:
+    with _lock:
+        return dict(_pending_au) if _pending_au else None
+
+
+def clear_pending_animeunity() -> None:
+    global _pending_au
+    with _lock:
+        _pending_au = None
+
+
+def _set_pending_animeunity(candidate: dict | None) -> None:
+    global _pending_au
+    with _lock:
+        _pending_au = candidate
+
+
+def verify_animeunity(host: str) -> bool:
+    """Whether *host* serves AnimeUnity's own front page.
+
+    Stricter than ``hosts.verify_animeunity``, which a typed-in host goes
+    through and which only looks for the word "animeunity" in the page — a parked
+    domain with the name in its title passes that. A host found by guessing has
+    to show what the real page is made of: the CSRF meta the archive endpoint
+    needs, and one of the two components the start page is read from.
+    """
+    try:
+        response = animeunity._get_scraper().get(
+            f"https://{host}/", headers={"user-agent": get_headers()},
+            timeout=_AU_PROBE_TIMEOUT)
+        response.raise_for_status()
+    except Exception as exc:
+        logger.info("Candidate %s failed verification: %s", host, exc)
+        return False
+    text = response.text.lower()
+    return ("animeunity" in text and 'name="csrf-token"' in text
+            and ("layout-items" in text or "the-carousel" in text))
+
+
+def animeunity_candidates(current: str) -> list[str]:
+    """``www.animeunity.<tld>`` for every TLD on the list, but the one in use."""
+    return [h for h in (f"www.animeunity.{tld}" for tld in AU_TLDS) if h != current]
+
+
+def _probe_animeunity(host: str) -> tuple[str, str | None]:
+    """``(host, None)`` for a usable candidate; otherwise why not.
+
+    The reason ``""`` means the name does not exist at all — most of the list,
+    most of the time — and is not worth a line in the report.
+    """
+    try:
+        socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return host, ""
+    ok, reason = is_plausible(host, AU_NAME_PATTERN)
+    if not ok:
+        return host, reason
+    if not verify_animeunity(host):
+        return host, "non verificato"
+    return host, None
+
+
+def apply_animeunity_candidate(host: str) -> None:
+    """Write a candidate as AnimeUnity's host, re-verifying it first.
+
+    Raises RuntimeError if it no longer checks out. Writes what Settings ›
+    Sorgente writes, and drops everything that was learned from the old host: the
+    CSRF token belongs to the host that issued it, and the shelves and archive
+    options are its pages.
+    """
+    ok, reason = is_plausible(host, AU_NAME_PATTERN)
+    if not ok:
+        raise RuntimeError(f"Dominio non adottabile: {reason}")
+    if not verify_animeunity(host):
+        raise RuntimeError(f"«{host}» non risponde come AnimeUnity")
+
+    config.update_data({"animeunity_domain": host})
+    animeunity.forget_csrf()
+    home.clear_cache("animeunity")
+    archive.clear_cache("animeunity")
+    clear_pending_animeunity()
+    logger.info("AnimeUnity host set to %s", host)
+
+
+def run_check_animeunity(force: bool = False) -> dict:
+    """One pass for AnimeUnity: does the configured host answer, and if not,
+    which of the usual names does.
+
+    ``force`` only bypasses the throttle. A working host is never replaced —
+    there is no list to read that could say it should be — so, unlike the
+    StreamingCommunity check, pressing the button on a healthy panel does not go
+    looking for a second one.
+    """
+    global _last_au_check_at
+
+    result: dict = {
+        "current": config.configured_animeunity_host(),
+        "current_ok": False,
+        "candidate": None,
+        "applied": False,
+        "rejected": [],
+        "checked": False,
+    }
+
+    if not force:
+        with _lock:
+            if _last_au_check_at is not None and _now() - _last_au_check_at < _MIN_CHECK_INTERVAL:
+                logger.debug("AnimeUnity check skipped: within the throttle window")
+                return result
+
+    with _lock:
+        _last_au_check_at = _now()
+    result["checked"] = True
+
+    result["current_ok"] = verify_animeunity(result["current"])
+    if result["current_ok"]:
+        _set_pending_animeunity(None)
+        return result
+
+    candidates = animeunity_candidates(result["current"])
+    with ThreadPoolExecutor(max_workers=_AU_PROBE_WORKERS) as pool:
+        probes = list(pool.map(_probe_animeunity, candidates))
+
+    for host, reason in probes:
+        if reason is None:
+            result["candidate"] = host
+            break
+        if reason:
+            result["rejected"].append({"host": host, "reason": reason})
+
+    if result["candidate"] is None:
+        return result
+
+    if _settings().get("domain_auto_apply"):
+        try:
+            apply_animeunity_candidate(result["candidate"])
+            result["applied"] = True
+            _announce(
+                "applied",
+                f"L'indirizzo di AnimeUnity è cambiato: ora è «{result['candidate']}». "
+                "Il pannello lo ha applicato da solo.",
+            )
+        except RuntimeError as exc:
+            logger.warning("Auto-apply of %s failed: %s", result["candidate"], exc)
+        return result
+
+    _set_pending_animeunity({
+        "host": result["candidate"],
+        "found_at": time.time(),
+    })
+    _announce(
+        "found",
+        f"AnimeUnity non risponde più su «{result['current']}». "
+        f"Trovato «{result['candidate']}»: apri il pannello per applicarlo.",
+    )
+    _broadcast_candidate()
+    return result
 
 
 # ── The cycle ─────────────────────────────────────────────────────────────────
@@ -406,3 +600,10 @@ async def domain_watch_loop():
             raise
         except Exception:
             logger.exception("Domain check failed")
+        # Its own try: one source being unreachable is no reason to skip the other.
+        try:
+            await asyncio.to_thread(run_check_animeunity)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("AnimeUnity host check failed")

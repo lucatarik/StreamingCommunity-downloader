@@ -30,6 +30,15 @@ _MAX_ENTRIES = 8
 # How many titles of a shelf are worth rendering. The source sends thirty.
 _SHELF_CAP = 30
 
+# AnimeUnity's featured carousel is the one shelf longer than that: forty-three
+# at the time of writing, and cutting it at thirty hid a third of the box.
+_FEATURED_CAP = 60
+
+# How long a start page that is missing its lazy-loaded shelves is kept. Short,
+# because the missing part is a failure to retry, not a quiet fact about the
+# source; but not zero, or a source that is down is asked on every page load.
+_PARTIAL_TTL = 60
+
 _cache: dict[tuple, tuple[float, list]] = {}
 _cache_lock = threading.Lock()
 
@@ -48,6 +57,7 @@ _LABELS = {
     ("streamingcommunity", "trending"): "Di tendenza",
     ("streamingcommunity", "latest"): "Aggiunti di recente",
     ("streamingcommunity", "top10"): "Top 10 di oggi",
+    ("streamingcommunity", "upcoming"): "In arrivo",
     ("animeunity", "latest_episodes"): "Ultimi episodi",
     ("animeunity", "featured"): "In evidenza",
 }
@@ -77,7 +87,7 @@ def _cached(key: tuple) -> list | None:
         return value
 
 
-def _store(key: tuple, value: list) -> None:
+def _store(key: tuple, value: list, ttl: int = _TTL) -> None:
     with _cache_lock:
         if len(_cache) >= _MAX_ENTRIES:
             now = _now()
@@ -85,7 +95,7 @@ def _store(key: tuple, value: list) -> None:
                 _cache.pop(stale, None)
             if len(_cache) >= _MAX_ENTRIES:
                 _cache.pop(next(iter(_cache)), None)
-        _cache[key] = (_now() + _TTL, value)
+        _cache[key] = (_now() + ttl, value)
 
 
 def clear_cache(source: str | None = None) -> None:
@@ -100,20 +110,49 @@ def clear_cache(source: str | None = None) -> None:
 
 # ── StreamingCommunity ────────────────────────────────────────────────────────
 
-def _sc_shelves(domain: str) -> list[dict]:
-    """The home page's own sliders: trending, recently added, today's top ten."""
+def _sc_shelf(slider: dict) -> dict | None:
+    """One slider of the source as a shelf, or None when it holds nothing usable."""
+    label = slider.get("label")
+    # Every genre slider is called "genre" and tells itself apart by its label,
+    # so the label has to be in the key or twenty-six shelves share one.
+    key = f"genre:{label}" if slider.get("name") == "genre" else (slider.get("name") or label)
+    if not key:
+        return None
+    items = [t for t in (page.normalize_title(raw)
+                         for raw in (slider.get("titles") or [])[:_SHELF_CAP]) if t]
+    if not items:
+        return None
+    return _shelf("streamingcommunity", key, items, fallback=label)
+
+
+def _sc_lazy_shelves(domain: str, props: dict) -> list[dict]:
+    """The shelves the home page only loads as you scroll: upcoming, then a
+    slider for every genre. Fetched together here, because a panel that renders
+    the whole start page at once has no scroll to wait for."""
+    specs = [{"name": "upcoming", "title_type": None, "genre": None}]
+    for genre in props.get("genres") or []:
+        name = genre.get("name") if isinstance(genre, dict) else None
+        if name:
+            specs.append({"name": "genre", "title_type": None, "genre": name})
+    return [s for s in (_sc_shelf(raw) for raw in page.fetch_sliders(domain, specs)) if s]
+
+
+def _sc_shelves(domain: str) -> tuple[list[dict], bool]:
+    """Every box of the source's home: the sliders in the page itself (trending,
+    recently added, today's top ten), then the lazy ones.
+
+    The second element says whether the lazy part arrived. A failure there
+    costs the extra shelves and nothing else — the page's own sliders are
+    already in hand and worth showing.
+    """
     props = page.fetch_site_props(domain)
-    shelves = []
-    for slider in props.get("sliders") or []:
-        key = slider.get("name") or slider.get("label")
-        if not key:
-            continue
-        items = [t for t in (page.normalize_title(raw)
-                             for raw in (slider.get("titles") or [])[:_SHELF_CAP]) if t]
-        if items:
-            shelves.append(_shelf("streamingcommunity", key, items,
-                                  fallback=slider.get("label")))
-    return shelves
+    shelves = [s for s in (_sc_shelf(raw) for raw in props.get("sliders") or []) if s]
+    try:
+        shelves.extend(_sc_lazy_shelves(domain, props))
+    except Exception as exc:
+        logger.warning("Cannot read the lazy shelves of %s: %s", domain, exc)
+        return shelves, False
+    return shelves, True
 
 
 # ── AnimeUnity ────────────────────────────────────────────────────────────────
@@ -160,9 +199,10 @@ def _au_shelves() -> list[dict]:
     featured = [t for t in (animeunity.normalize_title(r) for r in featured_raw) if t]
 
     shelves = []
-    for key, items in (("latest_episodes", latest), ("featured", featured)):
+    for key, items, cap in (("latest_episodes", latest, _SHELF_CAP),
+                            ("featured", featured, _FEATURED_CAP)):
         if items:
-            shelves.append(_shelf("animeunity", key, items[:_SHELF_CAP]))
+            shelves.append(_shelf("animeunity", key, items[:cap]))
     return shelves
 
 
@@ -192,10 +232,11 @@ def shelves(source: str, domain: str) -> list[dict]:
         return hit
 
     try:
-        result = _au_shelves() if source == "animeunity" else _sc_shelves(domain)
+        result, complete = (_au_shelves(), True) if source == "animeunity" \
+            else _sc_shelves(domain)
     except Exception:
         logger.exception("Cannot read the front page of %s", source)
         return []
 
-    _store(key, result)
+    _store(key, result, _TTL if complete else _PARTIAL_TTL)
     return result

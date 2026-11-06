@@ -103,59 +103,85 @@ async function loadDomainStatus() {
 // happens quietly.
 
 let _domainCandidate = null;
+// AnimeUnity moves on its own schedule, so it has its own candidate and its own
+// banner: one found host must not stand in for the other.
+let _auCandidate = null;
 
 async function loadDomainCandidate() {
   try {
     const data = await api.get('/api/domain/candidate');
     _domainCandidate = data.candidate || null;
+    _auCandidate = data.animeunity_candidate || null;
     renderDomainBanner();
   } catch (e) { /* a missing banner is not worth a console error */ }
 }
 
-function renderDomainBanner() {
-  const banner = document.getElementById('domain-banner');
+function _renderBanner(bannerId, hostId, candidate) {
+  const banner = document.getElementById(bannerId);
   if (!banner) return;
-  if (!_domainCandidate) { banner.style.display = 'none'; return; }
-  document.getElementById('domain-banner-host').textContent = _domainCandidate.host;
+  if (!candidate) { banner.style.display = 'none'; return; }
+  document.getElementById(hostId).textContent = candidate.host;
   banner.style.display = '';
 }
 
-async function applyDomainCandidate() {
-  if (!_domainCandidate) return;
-  const btn = document.getElementById('domain-banner-apply');
+function renderDomainBanner() {
+  _renderBanner('domain-banner', 'domain-banner-host', _domainCandidate);
+  _renderBanner('au-domain-banner', 'au-domain-banner-host', _auCandidate);
+}
+
+async function applyDomainCandidate(source) {
+  const au = source === 'animeunity';
+  const candidate = au ? _auCandidate : _domainCandidate;
+  if (!candidate) return;
+  const btn = document.getElementById(au ? 'au-domain-banner-apply' : 'domain-banner-apply');
   btn.disabled = true;
   try {
     // The host is echoed back as a confirmation token: the server compares it
     // with what it found and refuses a mismatch rather than trusting it.
-    const data = await api.post('/api/domain/candidate/apply', {domain: _domainCandidate.host});
-    showToast(`Dominio aggiornato: ${data.domain}`, 'success');
-    _domainCandidate = null;
+    const data = await api.post('/api/domain/candidate/apply',
+      {domain: candidate.host, source: au ? 'animeunity' : 'streamingcommunity'});
+    if (au) {
+      showToast(`Indirizzo di AnimeUnity aggiornato: ${data.domain}`, 'success');
+      _auCandidate = null;
+      // The start page remembered the old host's shelves.
+      delete _homeCache.animeunity;
+    } else {
+      showToast(`Dominio aggiornato: ${data.domain}`, 'success');
+      _domainCandidate = null;
+    }
     renderDomainBanner();
-    await loadDomainStatus();
+    if (!au) await loadDomainStatus();
   } catch (e) {
     showToast(errText(e, 'Impossibile applicare il dominio'), 'danger');
   } finally { btn.disabled = false; }
 }
 
-async function dismissDomainCandidate() {
-  if (!await scConfirm('Ignorare il dominio trovato? Il pannello resta sul dominio attuale.')) return;
+async function dismissDomainCandidate(source) {
+  const au = source === 'animeunity';
+  if (!await scConfirm(au
+    ? "Ignorare l'indirizzo trovato? Il pannello resta su quello attuale."
+    : 'Ignorare il dominio trovato? Il pannello resta sul dominio attuale.')) return;
   try {
-    await api.post('/api/domain/candidate/dismiss');
+    await api.post(`/api/domain/candidate/dismiss?source=${au ? 'animeunity' : 'streamingcommunity'}`);
   } catch (e) { /* clearing a banner is best effort */ }
-  _domainCandidate = null;
+  if (au) _auCandidate = null; else _domainCandidate = null;
   renderDomainBanner();
 }
 
 // The banner is the shell's, not the search page's: it is about the source
 // every page reads from, and it happens to be rendered above the first one.
 registerActions({
-  'domain:apply':   () => applyDomainCandidate(),
-  'domain:dismiss': () => dismissDomainCandidate(),
+  'domain:apply':   d => applyDomainCandidate(d.source),
+  'domain:dismiss': d => dismissDomainCandidate(d.source),
   // The sidebar's nav. The page name rides on the same data-page the active
   // highlight already reads, so the two cannot disagree about which link is
   // which. Through navigate(), not showPage(), so a click leaves an address
   // behind and Back works between sections.
   'nav':            d => navigate(d.page),
+  // The browser's own history. Every page change that matters is a hash
+  // assignment (navigate()), so it is already an entry to go back to.
+  'nav:back':       () => history.back(),
+  'nav:forward':    () => history.forward(),
 });
 
 // ── Navigation ─────────────────────────────────────────────────────────────────
@@ -185,21 +211,23 @@ function closeMobileMenu() {
 function showPage(page, params = null) {
   closeMobileMenu();
   if (params) PAGE_HASH[page]?.apply?.(params);
-  ['search','downloads','files','requests','my-requests','watches','users','detail','settings'].forEach(p => {
+  ['search','archive','downloads','files','requests','my-requests','watches','users','detail','settings'].forEach(p => {
     const el = document.getElementById(`page-${p}`);
     if (el) el.style.display = p === page ? '' : 'none';
   });
   document.getElementById('page-title').textContent = {
-    search:'Cerca', downloads:'Download', files:'File',
+    search:'Cerca', archive:'Archivio', downloads:'Download', files:'File',
     requests:'Coda richieste', 'my-requests':'Le mie richieste',
     watches:'Serie seguite', users:'Utenti', detail:'', settings:'Impostazioni',
   }[page] ?? 'Cerca';
   document.querySelectorAll('.nav-link[data-page]').forEach(el =>
-    el.classList.toggle('active', el.dataset.page === page));
+    // The archive is a place you get to from searching, so Cerca stays lit.
+    el.classList.toggle('active', el.dataset.page === (page === 'archive' ? 'search' : page)));
   // Set before the loaders, so anything they call that writes the address —
   // a filter applying itself, a season loading — knows which page it is on.
   _routePage = page;
   if (page === 'search') searchPageEnter();
+  if (page === 'archive') archiveEnter();
   if (page === 'downloads') refreshJobs();
   if (page === 'files') loadFiles();
   if (page === 'requests') loadRequestQueue();

@@ -105,6 +105,40 @@ def fetch_site_props(domain: str, path: str = "", *, params: dict | None = None,
     return _data_page(response.text).get("props") or {}
 
 
+# What the source accepts in one call to its slider endpoint. It answers 422
+# ("sliders non può avere più di 6 elementi") for a seventh, so a caller with
+# more asks in lots of this size.
+SLIDER_BATCH = 6
+
+
+def fetch_sliders(domain: str, specs: list[dict], *, timeout: int = 10) -> list[dict]:
+    """The sliders the home page loads as you scroll: upcoming, one per genre.
+
+    Each spec is ``{"name": ..., "title_type": None, "genre": None}``, and every
+    genre slider is named ``genre`` with the genre in its own field. The route
+    sits at the root of the host — under the locale segment it is a 404 — and
+    needs neither a session nor an XSRF token, which is measured, not assumed:
+    the site's own page sends both because axios does.
+
+    ``specs`` may be any length; it is split into lots the source accepts. A lot
+    that fails raises, and the caller decides what a partial home page is worth.
+    """
+    sliders: list[dict] = []
+    for i in range(0, len(specs), SLIDER_BATCH):
+        response = requests.post(
+            f"https://{domain}/api/sliders/fetch",
+            params={"lang": "it"},
+            json={"sliders": specs[i:i + SLIDER_BATCH]},
+            headers={"user-agent": get_headers(), "accept": "application/json"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if isinstance(body, list):
+            sliders.extend(s for s in body if isinstance(s, dict))
+    return sliders
+
+
 def get_domain_version(domain: str) -> str | None:
     """Verify domain is reachable and return site version string.
 
