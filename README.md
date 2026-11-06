@@ -134,7 +134,37 @@
 
 ---
 
+> **Fork of [EdoardoFiore/StreamingCommunity-downloader](https://github.com/EdoardoFiore/StreamingCommunity-downloader)**,
+> in sync with upstream **v2.8.0**. Differences:
+>
+> - **Rust download engine** (`engine/`, binary `sc-dl-engine`). Everything below the resolved M3U8 URL —
+>   retries with backoff, AES-128, atomic segments, resume, ffmpeg mux — runs in a child process that can be killed.
+>   A lost segment fails the job, never a file with holes. Protocol: [`engine/README.md`](engine/README.md).
+> - **Stalled / cancelled jobs**: "Forza ripresa" resumes from the segments already on disk.
+> - **No Docker needed**: [`streaming-app.sh`](streaming-app.sh) runs the panel in a Python venv as a desktop-style window.
+> - The Docker image still works: the `Dockerfile` builds the engine in a first stage.
+> - [`patches/rust-engine.patch`](patches/rust-engine.patch) is the whole fork as one patch against upstream v2.8.0
+>   (`git apply patches/rust-engine.patch`).
+
 ## Quick Start
+
+### Without Docker (this fork)
+
+```bash
+git clone https://github.com/lucatarik/StreamingCommunity-downloader.git
+cd StreamingCommunity-downloader
+./streaming-app.sh            # venv + engine build on first run, then a window; closing it stops everything
+./streaming-app.sh --no-app   # server only, open the URL yourself
+./streaming-app.sh --setup    # rebuild the venv
+```
+
+Needs Python ≥ 3.11, FFmpeg, and [Rust](https://rustup.rs) for the first run (the engine is compiled once and cached).
+State (venv, `panel.db`, `data.json`, tmp, log) lives in `~/.local/share/streaming-downloader/`;
+the library is `$SC_LIBRARY` (default `~/Scaricati`, else `~/Video`). Port: first free of 8000, 8001, 8002, 8010, 8080.
+In-panel self-update is Docker-only: here, `git pull` and restart.
+
+Tests: `cargo test --manifest-path engine/Cargo.toml` (needs ffmpeg + ffprobe), `pytest -q`.
+
 
 ### Docker (recommended)
 
@@ -203,7 +233,7 @@ production config volume upgrades the real database with no way back.
 ### From source
 
 ```bash
-git clone https://github.com/EdoardoFiore/StreamingCommunity-downloader.git
+git clone https://github.com/lucatarik/StreamingCommunity-downloader.git
 cd StreamingCommunity-downloader
 pip install -r requirements.txt
 python main.py
@@ -212,7 +242,7 @@ pip install -r requirements-dev.txt   # tests only
 pytest -q
 ```
 
-**Prerequisites:** Python ≥ 3.11, FFmpeg.
+**Prerequisites:** Python ≥ 3.11, FFmpeg, and the engine built (`cargo build --release --manifest-path engine/Cargo.toml`; point `SC_ENGINE_BIN` at it or put it on PATH).
 
 ### Upgrading from v1
 
